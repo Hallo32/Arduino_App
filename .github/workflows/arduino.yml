@@ -28,5 +28,36 @@ jobs:
 
       - name: Compile Blinky
         run: arduino-cli compile \
+          --export-binaries \
+          --output-dir build/esp32c6 \
           --fqbn esp32:esp32:esp32c6:PartitionScheme=no_fs \
           blinky
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blinky-esp32c6-firmware
+          path: build/esp32c6/
+
+  release:
+    name: Create GitHub release
+    if: github.event_name == 'push'
+    needs: compile
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download firmware artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: blinky-esp32c6-firmware
+          path: release-assets
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "build-${GITHUB_RUN_ID}" release-assets/* \
+          --target "$GITHUB_SHA" \
+          --title "Build ${GITHUB_RUN_NUMBER}" \
+          --generate-notes
