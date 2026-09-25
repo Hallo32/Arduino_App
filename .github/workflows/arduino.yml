@@ -60,6 +60,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "build-${GITHUB_RUN_ID}" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Build ${GITHUB_RUN_NUMBER}" \
             --generate-notes
