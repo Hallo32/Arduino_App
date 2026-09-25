@@ -27,4 +27,6 @@ jobs:
           arduino-cli core install esp32:esp32@3.3.12
 
       - name: Compile Blinky
-        run: arduino-cli compile --fqbn esp32:esp32:esp32c6 blinky
+        run: arduino-cli compile \
+          --fqbn esp32:esp32:esp32c6:PartitionScheme=no_fs \
+          blinky
