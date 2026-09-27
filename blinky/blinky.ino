@@ -60,6 +60,18 @@ void startWifiProvisioning() {
 void printSerialHelp() {
   Serial.println("Serial commands:");
   Serial.println("  wifi - configure Wi-Fi credentials");
+  Serial.println("  Ctrl+C - cancel Wi-Fi configuration");
+}
+
+void cancelWifiProvisioning() {
+  provisioningState = ProvisioningState::Idle;
+  pendingSsid = "";
+  serialLine = "";
+  Serial.println("Wi-Fi setup cancelled; existing credentials were preserved");
+
+  if (!wifiSsid.isEmpty()) {
+    connectToWifi();
+  }
 }
 
 bool saveWifiCredentials(const String &ssid, const String &password) {
@@ -116,6 +128,11 @@ void handleSerialLine(const String &line) {
 void handleSerialInput() {
   while (Serial.available() > 0) {
     const char character = static_cast<char>(Serial.read());
+    if (character == 0x03) {
+      cancelWifiProvisioning();
+      continue;
+    }
+
     if (character == '\r') {
       continue;
     }
