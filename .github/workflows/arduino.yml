@@ -27,7 +27,7 @@ jobs:
           arduino-cli core install esp32:esp32@3.3.12
 
       - name: Install ArduinoJson
-        run: arduino-cli lib install ArduinoJson@7.4.2
+        run: arduino-cli lib install ArduinoJson@7.4.3
 
       - name: Compile Blinky
         run: |
