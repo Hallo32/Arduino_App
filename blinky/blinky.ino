@@ -219,8 +219,17 @@ void checkForFirmwareUpdate() {
   HTTPUpdate updater;
   updater.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   updater.rebootOnUpdate(false);
-  updater.onProgress([](int current, int total) {
-    Serial.printf("OTA progress: %d%%\n", total > 0 ? current * 100 / total : 0);
+  int lastReportedPercent = -1;
+  updater.onProgress([&lastReportedPercent](int current, int total) {
+    if (total <= 0) {
+      return;
+    }
+
+    const int percent = current * 100 / total;
+    if (percent != lastReportedPercent) {
+      lastReportedPercent = percent;
+      Serial.printf("OTA progress: %d%%\n", percent);
+    }
   });
 
   const t_httpUpdate_return result =
