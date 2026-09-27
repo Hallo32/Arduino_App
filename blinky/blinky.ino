@@ -10,8 +10,8 @@
 constexpr char GITHUB_RELEASE_API[] =
     "https://api.github.com/repos/Hallo32/Arduino_App/releases/latest";
 constexpr char FIRMWARE_ASSET_NAME[] = "blinky.ino.bin";
-constexpr char WIFI_NAMESPACE[] = "blinky_wifi";
-constexpr char OTA_NAMESPACE[] = "blinky_ota";
+constexpr char WIFI_NAMESPACE[] = "wifi";
+constexpr char OTA_NAMESPACE[] = "ota";
 constexpr uint32_t BLINK_INTERVAL_MS = 500;
 constexpr uint32_t TIME_SYNC_TIMEOUT_MS = 20000;
 constexpr time_t VALID_TIME_THRESHOLD = 1700000000;
