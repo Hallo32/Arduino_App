@@ -50,8 +50,11 @@ void connectToWifi() {
 }
 
 void startWifiProvisioning() {
+  WiFi.disconnect(false, false);
+  pendingSsid = "";
   provisioningState = ProvisioningState::WaitingForSsid;
-  Serial.println("Wi-Fi setup: enter SSID in the serial monitor (115200 baud)");
+  Serial.println("Wi-Fi setup: existing credentials will be overwritten");
+  Serial.println("Enter SSID in the serial monitor");
 }
 
 void printSerialHelp() {
