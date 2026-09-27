@@ -282,9 +282,10 @@ void checkForFirmwareUpdate() {
     Serial.println("OTA skipped: could not start GitHub API request");
     return;
   }
+  apiRequest.setTimeout(15000);
 
   apiRequest.addHeader("Accept", "application/vnd.github+json");
-  apiRequest.addHeader("User-Agent", "ESP32-C6-Blinky");
+  apiRequest.addHeader("User-Agent", "ESP32-C6");
   apiRequest.addHeader("X-GitHub-Api-Version", "2022-11-28");
   const int statusCode = apiRequest.GET();
   if (statusCode != HTTP_CODE_OK) {
@@ -293,10 +294,17 @@ void checkForFirmwareUpdate() {
     return;
   }
 
+  const String releasePayload = apiRequest.getString();
+  apiRequest.end();
+
+  if (releasePayload.isEmpty()) {
+    Serial.println("Could not parse GitHub release JSON: empty response");
+    return;
+  }
+
   JsonDocument release;
   const DeserializationError jsonError =
-      deserializeJson(release, apiRequest.getStream());
-  apiRequest.end();
+      deserializeJson(release, releasePayload);
   if (jsonError) {
     Serial.printf("Could not parse GitHub release JSON: %s\n", jsonError.c_str());
     return;
