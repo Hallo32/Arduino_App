@@ -54,6 +54,11 @@ void startWifiProvisioning() {
   Serial.println("Wi-Fi setup: enter SSID in the serial monitor (115200 baud)");
 }
 
+void printSerialHelp() {
+  Serial.println("Serial commands:");
+  Serial.println("  wifi - configure Wi-Fi credentials");
+}
+
 bool saveWifiCredentials(const String &ssid, const String &password) {
   Preferences preferences;
   if (!preferences.begin(WIFI_NAMESPACE, false)) {
@@ -246,6 +251,7 @@ void setup() {
   } else {
     connectToWifi();
   }
+  printSerialHelp();
 }
 
 void loop() {
