@@ -90,6 +90,8 @@ void handleSerialLine(const String &line) {
   if (provisioningState == ProvisioningState::Idle) {
     if (line == "wifi") {
       startWifiProvisioning();
+    } else if (line == "help" || line.isEmpty()) {
+      printSerialHelp();
     }
     return;
   }
