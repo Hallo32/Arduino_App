@@ -5,16 +5,20 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <stdlib.h>
 #include <time.h>
 
 constexpr char GITHUB_RELEASE_API[] =
     "https://api.github.com/repos/Hallo32/Arduino_App/releases/latest";
 constexpr char FIRMWARE_ASSET_NAME[] = "blinky.ino.bin";
+constexpr char DEVICE_HOSTNAME_PREFIX[] = "ESP32-C6-";
 constexpr char WIFI_NAMESPACE[] = "wifi";
 constexpr char OTA_NAMESPACE[] = "ota";
 constexpr uint32_t BLINK_INTERVAL_MS = 500;
 constexpr uint32_t TIME_SYNC_TIMEOUT_MS = 20000;
 constexpr time_t VALID_TIME_THRESHOLD = 1700000000;
+constexpr char GERMAN_TIME_ZONE[] =
+  "CET-1CEST,M3.5.0/2,M10.5.0/3";
 
 enum class ProvisioningState : uint8_t { Idle, WaitingForSsid, WaitingForPassword };
 
@@ -24,9 +28,12 @@ uint32_t lastLedToggle = 0;
 String wifiSsid;
 String wifiPassword;
 String installedReleaseTag;
+String deviceHostname;
 String pendingSsid;
 String serialLine;
 ProvisioningState provisioningState = ProvisioningState::Idle;
+
+void checkForFirmwareUpdate();
 
 void loadSettings() {
   Preferences preferences;
@@ -44,6 +51,7 @@ void loadSettings() {
 
 void connectToWifi() {
   WiFi.mode(WIFI_STA);
+  WiFi.setHostname(deviceHostname.c_str());
   WiFi.setAutoReconnect(true);
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
   Serial.println("Connecting to saved Wi-Fi network");
@@ -57,10 +65,83 @@ void startWifiProvisioning() {
   Serial.println("Enter SSID in the serial monitor");
 }
 
+String createDeviceHostname() {
+  const uint64_t mac = ESP.getEfuseMac();
+  char hostname[32];
+  snprintf(hostname, sizeof(hostname), "%s%06llX", DEVICE_HOSTNAME_PREFIX,
+           static_cast<unsigned long long>(mac & 0xFFFFFFULL));
+  return String(hostname);
+}
+
 void printSerialHelp() {
   Serial.println("Serial commands:");
   Serial.println("  wifi - configure Wi-Fi credentials");
   Serial.println("  Ctrl+C - cancel Wi-Fi configuration");
+  Serial.println("  ip - show the current IP address");
+  Serial.println("  hostname - show the device hostname");
+  Serial.println("  wlan - show Wi-Fi network information");
+  Serial.println("  time - show UTC and German local time");
+  Serial.println("  version - show the installed firmware version");
+  Serial.println("  update - check for a firmware update");
+}
+
+void printIpAddress() {
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("IP address: Wi-Fi is not connected");
+  }
+}
+
+void printHostname() {
+  const char *hostname = WiFi.getHostname();
+  Serial.printf("Hostname: %s\n", hostname != nullptr ? hostname : "not set");
+}
+
+void printWlanInfo() {
+  Serial.printf("Wi-Fi status: %s\n", WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
+  Serial.printf("Signal strength: %d dBm\n", WiFi.RSSI());
+  Serial.printf("MAC address: %s\n", WiFi.macAddress().c_str());
+  Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
+  Serial.printf("Subnet mask: %s\n", WiFi.subnetMask().toString().c_str());
+  Serial.printf("DNS server: %s\n", WiFi.dnsIP().toString().c_str());
+}
+
+void printCurrentTime() {
+  const time_t currentTime = time(nullptr);
+  if (currentTime < VALID_TIME_THRESHOLD) {
+    Serial.println("Time: not synchronized");
+    return;
+  }
+
+  struct tm utcTime;
+  gmtime_r(&currentTime, &utcTime);
+
+  struct tm localTime;
+  localtime_r(&currentTime, &localTime);
+  char formattedUtcTime[24];
+  char formattedLocalTime[24];
+  strftime(formattedUtcTime, sizeof(formattedUtcTime), "%Y-%m-%dT%H:%M:%S",
+           &utcTime);
+  strftime(formattedLocalTime, sizeof(formattedLocalTime), "%Y-%m-%dT%H:%M:%S",
+           &localTime);
+  Serial.printf("Time (UTC): %sZ\n", formattedUtcTime);
+  Serial.printf("Time (Germany): %s %s\n", formattedLocalTime,
+                localTime.tm_isdst > 0 ? "CEST" : "CET");
+}
+
+void printFirmwareVersion() {
+  if (installedReleaseTag.isEmpty()) {
+    Serial.println("Firmware version: unknown (no release tag in NVS)");
+  } else {
+    Serial.printf("Firmware version: %s\n", installedReleaseTag.c_str());
+  }
 }
 
 void cancelWifiProvisioning() {
@@ -92,6 +173,18 @@ void handleSerialLine(const String &line) {
       startWifiProvisioning();
     } else if (line == "help" || line.isEmpty()) {
       printSerialHelp();
+    } else if (line == "ip") {
+      printIpAddress();
+    } else if (line == "hostname") {
+      printHostname();
+    } else if (line == "wlan") {
+      printWlanInfo();
+    } else if (line == "time") {
+      printCurrentTime();
+    } else if (line == "version") {
+      printFirmwareVersion();
+    } else if (line == "update") {
+      checkForFirmwareUpdate();
     }
     return;
   }
@@ -273,8 +366,11 @@ void checkForFirmwareUpdate() {
 
 void setup() {
   Serial.begin(115200);
+  setenv("TZ", GERMAN_TIME_ZONE, 1);
+  tzset();
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
+  deviceHostname = createDeviceHostname();
   loadSettings();
 
   if (wifiSsid.isEmpty()) {
