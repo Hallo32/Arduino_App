@@ -45,3 +45,15 @@ sind sie dort nicht verschlüsselt.
 Der OTA-Pfad erwartet öffentliche GitHub-Releases mit dem Asset
 `blinky.ino.bin`. Pull-Request-Builds erzeugen keine Releases und sind nicht als
 OTA-Quelle vorgesehen.
+
+## BLE-UART
+
+Der ESP32-C6 stellt zusätzlich den Nordic UART Service (NUS) bereit. Mit einer
+BLE-UART-App Befehle zeilenweise an die RX-Characteristic senden; Antworten
+kommen als Notifications über TX. Die Service-UUID lautet
+`6E400001-B5A3-F393-E0A9-E50E24DCCA9E`, RX `6E400002-B5A3-F393-E0A9-E50E24DCCA9E`
+und TX `6E400003-B5A3-F393-E0A9-E50E24DCCA9E`.
+
+Bei bestehender BLE-Verbindung wird alle fünf Minuten eine Meldung mit der
+internen Chiptemperatur in Grad Celsius gesendet. Das ist die Temperatur des
+ESP32-Chips, nicht die Umgebungstemperatur.

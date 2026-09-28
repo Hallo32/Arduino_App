@@ -1,21 +1,31 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <math.h>
+#include <stdarg.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 constexpr char GITHUB_RELEASE_API[] =
     "https://api.github.com/repos/Hallo32/Arduino_App/releases/latest";
 constexpr char FIRMWARE_ASSET_NAME[] = "blinky.ino.bin";
 constexpr char DEVICE_HOSTNAME_PREFIX[] = "ESP32-C6-";
+constexpr char BLE_UART_SERVICE_UUID[] = "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr char BLE_UART_RX_UUID[] = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+constexpr char BLE_UART_TX_UUID[] = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 constexpr char WIFI_NAMESPACE[] = "wifi";
 constexpr char OTA_NAMESPACE[] = "ota";
 constexpr uint32_t BLINK_INTERVAL_MS = 500;
 constexpr uint32_t TIME_SYNC_TIMEOUT_MS = 20000;
+constexpr uint32_t TEMPERATURE_INTERVAL_MS = 300000;
 constexpr time_t VALID_TIME_THRESHOLD = 1700000000;
 constexpr char GERMAN_TIME_ZONE[] =
   "CET-1CEST,M3.5.0/2,M10.5.0/3";
@@ -32,8 +42,96 @@ String deviceHostname;
 String pendingSsid;
 String serialLine;
 ProvisioningState provisioningState = ProvisioningState::Idle;
+BLEServer *bleServer = nullptr;
+BLECharacteristic *bleTxCharacteristic = nullptr;
+QueueHandle_t bleCommandQueue = nullptr;
+uint32_t lastTemperatureSent = 0;
+
+struct BleCommand {
+  char text[65];
+};
+
+void sendBleText(const char *text, size_t length) {
+  if (bleTxCharacteristic == nullptr || bleServer == nullptr ||
+      bleServer->getConnectedCount() == 0) {
+    return;
+  }
+
+  constexpr size_t BLE_CHUNK_SIZE = 20;
+  for (size_t offset = 0; offset < length; offset += BLE_CHUNK_SIZE) {
+    const size_t chunkLength = min(BLE_CHUNK_SIZE, length - offset);
+    bleTxCharacteristic->setValue(
+        reinterpret_cast<const uint8_t *>(text + offset), chunkLength);
+    bleTxCharacteristic->notify();
+    delay(10);
+  }
+}
+
+void consolePrintln(const char *text) {
+  Serial.println(text);
+  sendBleText(text, strlen(text));
+  sendBleText("\r\n", 2);
+}
+
+void consolePrintf(const char *format, ...) {
+  char buffer[256];
+  va_list arguments;
+  va_start(arguments, format);
+  const int length = vsnprintf(buffer, sizeof(buffer), format, arguments);
+  va_end(arguments);
+
+  if (length <= 0) {
+    return;
+  }
+
+  const size_t outputLength = min(static_cast<size_t>(length), sizeof(buffer) - 1);
+  Serial.write(reinterpret_cast<const uint8_t *>(buffer), outputLength);
+  sendBleText(buffer, outputLength);
+}
+
+class BleUartRxCallbacks : public BLECharacteristicCallbacks {
+ public:
+  void onWrite(BLECharacteristic *characteristic) override {
+    const uint8_t *data = characteristic->getData();
+    const size_t length = characteristic->getLength();
+
+    for (size_t index = 0; index < length; ++index) {
+      const char value = static_cast<char>(data[index]);
+      if (value == '\r') {
+        continue;
+      }
+
+      if (value == '\n' || value == 0x03) {
+        BleCommand command{};
+        if (value == 0x03) {
+          command.text[0] = value;
+        } else {
+          memcpy(command.text, line_, lineLength_);
+          command.text[lineLength_] = '\0';
+        }
+        if (bleCommandQueue != nullptr) {
+          xQueueSend(bleCommandQueue, &command, 0);
+        }
+        lineLength_ = 0;
+        continue;
+      }
+
+      if (lineLength_ < sizeof(line_) - 1) {
+        line_[lineLength_++] = value;
+      } else {
+        lineLength_ = 0;
+      }
+    }
+  }
+
+ private:
+  char line_[64]{};
+  size_t lineLength_ = 0;
+};
 
 void checkForFirmwareUpdate();
+void handleSerialLine(const String &line);
+void cancelWifiProvisioning();
 
 void loadSettings() {
   Preferences preferences;
@@ -54,15 +152,15 @@ void connectToWifi() {
   WiFi.setHostname(deviceHostname.c_str());
   WiFi.setAutoReconnect(true);
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
-  Serial.println("Connecting to saved Wi-Fi network");
+  consolePrintln("Connecting to saved Wi-Fi network");
 }
 
 void startWifiProvisioning() {
   WiFi.disconnect(false, false);
   pendingSsid = "";
   provisioningState = ProvisioningState::WaitingForSsid;
-  Serial.println("Wi-Fi setup: existing credentials will be overwritten");
-  Serial.println("Enter SSID in the serial monitor");
+  consolePrintln("Wi-Fi setup: existing credentials will be overwritten");
+  consolePrintln("Enter SSID in the serial monitor");
 }
 
 String createDeviceHostname() {
@@ -73,50 +171,96 @@ String createDeviceHostname() {
   return String(hostname);
 }
 
+void startBleUart() {
+  if (!BLEDevice::init(deviceHostname)) {
+    consolePrintln("BLE initialization failed");
+    return;
+  }
+
+  bleCommandQueue = xQueueCreate(4, sizeof(BleCommand));
+  if (bleCommandQueue == nullptr) {
+    consolePrintln("BLE UART command queue creation failed");
+    return;
+  }
+
+  bleServer = BLEDevice::createServer();
+  BLEService *service = bleServer->createService(BLE_UART_SERVICE_UUID);
+  BLECharacteristic *rxCharacteristic = service->createCharacteristic(
+      BLE_UART_RX_UUID,
+      BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  rxCharacteristic->setCallbacks(new BleUartRxCallbacks());
+
+  bleTxCharacteristic = service->createCharacteristic(
+      BLE_UART_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  bleTxCharacteristic->setValue("");
+
+  service->start();
+  BLEAdvertising *advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(BLE_UART_SERVICE_UUID);
+  advertising->setScanResponse(true);
+  BLEDevice::startAdvertising();
+  consolePrintln("BLE UART ready; connect with a Nordic UART compatible app");
+}
+
+void processBleCommands() {
+  if (bleCommandQueue == nullptr) {
+    return;
+  }
+
+  BleCommand command;
+  while (xQueueReceive(bleCommandQueue, &command, 0) == pdTRUE) {
+    if (static_cast<uint8_t>(command.text[0]) == 0x03) {
+      cancelWifiProvisioning();
+    } else {
+      handleSerialLine(String(command.text));
+    }
+  }
+}
+
 void printSerialHelp() {
-  Serial.println("Serial commands:");
-  Serial.println("  wifi - configure Wi-Fi credentials");
-  Serial.println("  Ctrl+C - cancel Wi-Fi configuration");
-  Serial.println("  ip - show the current IP address");
-  Serial.println("  hostname - show the device hostname");
-  Serial.println("  wlan - show Wi-Fi network information");
-  Serial.println("  time - show UTC and German local time");
-  Serial.println("  version - show the installed firmware version");
-  Serial.println("  update - check for a firmware update");
+  consolePrintln("Serial commands:");
+  consolePrintln("  wifi - configure Wi-Fi credentials");
+  consolePrintln("  Ctrl+C - cancel Wi-Fi configuration");
+  consolePrintln("  ip - show the current IP address");
+  consolePrintln("  hostname - show the device hostname");
+  consolePrintln("  wlan - show Wi-Fi network information");
+  consolePrintln("  time - show UTC and German local time");
+  consolePrintln("  version - show the installed firmware version");
+  consolePrintln("  update - check for a firmware update");
 }
 
 void printIpAddress() {
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
+    consolePrintf("IP address: %s\n", WiFi.localIP().toString().c_str());
   } else {
-    Serial.println("IP address: Wi-Fi is not connected");
+    consolePrintln("IP address: Wi-Fi is not connected");
   }
 }
 
 void printHostname() {
   const char *hostname = WiFi.getHostname();
-  Serial.printf("Hostname: %s\n", hostname != nullptr ? hostname : "not set");
+  consolePrintf("Hostname: %s\n", hostname != nullptr ? hostname : "not set");
 }
 
 void printWlanInfo() {
-  Serial.printf("Wi-Fi status: %s\n", WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
+  consolePrintf("Wi-Fi status: %s\n", WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
   if (WiFi.status() != WL_CONNECTED) {
     return;
   }
 
-  Serial.printf("SSID: %s\n", WiFi.SSID().c_str());
-  Serial.printf("Signal strength: %d dBm\n", WiFi.RSSI());
-  Serial.printf("MAC address: %s\n", WiFi.macAddress().c_str());
-  Serial.printf("IP address: %s\n", WiFi.localIP().toString().c_str());
-  Serial.printf("Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
-  Serial.printf("Subnet mask: %s\n", WiFi.subnetMask().toString().c_str());
-  Serial.printf("DNS server: %s\n", WiFi.dnsIP().toString().c_str());
+  consolePrintf("SSID: %s\n", WiFi.SSID().c_str());
+  consolePrintf("Signal strength: %d dBm\n", WiFi.RSSI());
+  consolePrintf("MAC address: %s\n", WiFi.macAddress().c_str());
+  consolePrintf("IP address: %s\n", WiFi.localIP().toString().c_str());
+  consolePrintf("Gateway: %s\n", WiFi.gatewayIP().toString().c_str());
+  consolePrintf("Subnet mask: %s\n", WiFi.subnetMask().toString().c_str());
+  consolePrintf("DNS server: %s\n", WiFi.dnsIP().toString().c_str());
 }
 
 void printCurrentTime() {
   const time_t currentTime = time(nullptr);
   if (currentTime < VALID_TIME_THRESHOLD) {
-    Serial.println("Time: not synchronized");
+    consolePrintln("Time: not synchronized");
     return;
   }
 
@@ -131,16 +275,16 @@ void printCurrentTime() {
            &utcTime);
   strftime(formattedLocalTime, sizeof(formattedLocalTime), "%Y-%m-%dT%H:%M:%S",
            &localTime);
-  Serial.printf("Time (UTC): %sZ\n", formattedUtcTime);
-  Serial.printf("Time (Germany): %s %s\n", formattedLocalTime,
+  consolePrintf("Time (UTC): %sZ\n", formattedUtcTime);
+  consolePrintf("Time (Germany): %s %s\n", formattedLocalTime,
                 localTime.tm_isdst > 0 ? "CEST" : "CET");
 }
 
 void printFirmwareVersion() {
   if (installedReleaseTag.isEmpty()) {
-    Serial.println("Firmware version: unknown (no release tag in NVS)");
+    consolePrintln("Firmware version: unknown (no release tag in NVS)");
   } else {
-    Serial.printf("Firmware version: %s\n", installedReleaseTag.c_str());
+    consolePrintf("Firmware version: %s\n", installedReleaseTag.c_str());
   }
 }
 
@@ -148,7 +292,7 @@ void cancelWifiProvisioning() {
   provisioningState = ProvisioningState::Idle;
   pendingSsid = "";
   serialLine = "";
-  Serial.println("Wi-Fi setup cancelled; existing credentials were preserved");
+  consolePrintln("Wi-Fi setup cancelled; existing credentials were preserved");
 
   if (!wifiSsid.isEmpty()) {
     connectToWifi();
@@ -191,23 +335,23 @@ void handleSerialLine(const String &line) {
 
   if (provisioningState == ProvisioningState::WaitingForSsid) {
     if (line.isEmpty() || line.length() > 32) {
-      Serial.println("SSID must contain 1 to 32 characters; enter it again");
+      consolePrintln("SSID must contain 1 to 32 characters; enter it again");
       return;
     }
 
     pendingSsid = line;
     provisioningState = ProvisioningState::WaitingForPassword;
-    Serial.println("Enter Wi-Fi password (empty for an open network)");
+    consolePrintln("Enter Wi-Fi password (empty for an open network)");
     return;
   }
 
   if (line.length() > 63) {
-    Serial.println("Password is too long; enter it again");
+    consolePrintln("Password is too long; enter it again");
     return;
   }
 
   if (!saveWifiCredentials(pendingSsid, line)) {
-    Serial.println("Could not save Wi-Fi credentials to NVS; retry with 'wifi'");
+    consolePrintln("Could not save Wi-Fi credentials to NVS; retry with 'wifi'");
     provisioningState = ProvisioningState::Idle;
     return;
   }
@@ -239,7 +383,7 @@ void handleSerialInput() {
       serialLine += character;
     } else {
       serialLine = "";
-      Serial.println("Input too long; line discarded");
+      consolePrintln("Input too long; line discarded");
     }
   }
 }
@@ -269,7 +413,7 @@ bool saveInstalledReleaseTag(const String &tag) {
 
 void checkForFirmwareUpdate() {
   if (!synchronizeClock()) {
-    Serial.println("OTA skipped: system time could not be synchronized");
+    consolePrintln("OTA skipped: system time could not be synchronized");
     return;
   }
 
@@ -279,7 +423,7 @@ void checkForFirmwareUpdate() {
 
   HTTPClient apiRequest;
   if (!apiRequest.begin(apiClient, GITHUB_RELEASE_API)) {
-    Serial.println("OTA skipped: could not start GitHub API request");
+    consolePrintln("OTA skipped: could not start GitHub API request");
     return;
   }
   apiRequest.setTimeout(15000);
@@ -289,7 +433,7 @@ void checkForFirmwareUpdate() {
   apiRequest.addHeader("X-GitHub-Api-Version", "2022-11-28");
   const int statusCode = apiRequest.GET();
   if (statusCode != HTTP_CODE_OK) {
-    Serial.printf("GitHub API request failed with HTTP %d\n", statusCode);
+    consolePrintf("GitHub API request failed with HTTP %d\n", statusCode);
     apiRequest.end();
     return;
   }
@@ -298,7 +442,7 @@ void checkForFirmwareUpdate() {
   apiRequest.end();
 
   if (releasePayload.isEmpty()) {
-    Serial.println("Could not parse GitHub release JSON: empty response");
+    consolePrintln("Could not parse GitHub release JSON: empty response");
     return;
   }
 
@@ -306,7 +450,7 @@ void checkForFirmwareUpdate() {
   const DeserializationError jsonError =
       deserializeJson(release, releasePayload);
   if (jsonError) {
-    Serial.printf("Could not parse GitHub release JSON: %s\n", jsonError.c_str());
+    consolePrintf("Could not parse GitHub release JSON: %s\n", jsonError.c_str());
     return;
   }
 
@@ -320,21 +464,21 @@ void checkForFirmwareUpdate() {
   }
 
   if (latestTag.isEmpty() || firmwareUrl.isEmpty()) {
-    Serial.println("Latest GitHub release has no tag or firmware asset");
+    consolePrintln("Latest GitHub release has no tag or firmware asset");
     return;
   }
 
   if (latestTag == installedReleaseTag) {
-    Serial.printf("OTA: release %s is already installed\n", latestTag.c_str());
+    consolePrintf("OTA: release %s is already installed\n", latestTag.c_str());
     return;
   }
 
   if (!firmwareUrl.startsWith("https://")) {
-    Serial.println("OTA skipped: release asset URL is not HTTPS");
+    consolePrintln("OTA skipped: release asset URL is not HTTPS");
     return;
   }
 
-  Serial.printf("Installing GitHub release %s\n", latestTag.c_str());
+  consolePrintf("Installing GitHub release %s\n", latestTag.c_str());
   WiFiClientSecure firmwareClient;
   firmwareClient.useBuiltinCACertBundle();
   firmwareClient.setTimeout(15000);
@@ -351,7 +495,7 @@ void checkForFirmwareUpdate() {
     const int percent = current * 100 / total;
     if (percent != lastReportedPercent) {
       lastReportedPercent = percent;
-      Serial.printf("OTA progress: %d%%\n", percent);
+      consolePrintf("OTA progress: %d%%\n", percent);
     }
   });
 
@@ -359,15 +503,15 @@ void checkForFirmwareUpdate() {
       updater.update(firmwareClient, firmwareUrl, installedReleaseTag);
 
   if (result == HTTP_UPDATE_NO_UPDATES) {
-    Serial.println("OTA server reports no update");
+    consolePrintln("OTA server reports no update");
   } else if (result == HTTP_UPDATE_FAILED) {
-    Serial.printf("OTA failed (%d): %s\n", updater.getLastError(),
+    consolePrintf("OTA failed (%d): %s\n", updater.getLastError(),
                   updater.getLastErrorString().c_str());
   } else if (result == HTTP_UPDATE_OK) {
     if (!saveInstalledReleaseTag(latestTag)) {
-      Serial.println("Could not save installed release tag to NVS");
+      consolePrintln("Could not save installed release tag to NVS");
     }
-    Serial.println("OTA complete; restarting");
+    consolePrintln("OTA complete; restarting");
     ESP.restart();
   }
 }
@@ -380,6 +524,8 @@ void setup() {
   digitalWrite(LED_BUILTIN, LOW);
   deviceHostname = createDeviceHostname();
   loadSettings();
+  startBleUart();
+  lastTemperatureSent = millis();
 
   if (wifiSsid.isEmpty()) {
     startWifiProvisioning();
@@ -391,6 +537,7 @@ void setup() {
 
 void loop() {
   handleSerialInput();
+  processBleCommands();
 
   const uint32_t now = millis();
   if (now - lastLedToggle >= BLINK_INTERVAL_MS) {
@@ -401,7 +548,19 @@ void loop() {
 
   if (!otaCheckComplete && WiFi.status() == WL_CONNECTED) {
     otaCheckComplete = true;
-    Serial.println("Wi-Fi connected; checking latest GitHub release");
+    consolePrintln("Wi-Fi connected; checking latest GitHub release");
     checkForFirmwareUpdate();
+  }
+
+  if (bleServer != nullptr && bleServer->getConnectedCount() > 0 &&
+      now - lastTemperatureSent >= TEMPERATURE_INTERVAL_MS) {
+    lastTemperatureSent = now;
+    const float temperatureCelsius = temperatureRead();
+    if (isfinite(temperatureCelsius)) {
+      consolePrintf("Internal ESP32-C6 temperature: %.2f deg C\r\n",
+                    temperatureCelsius);
+    } else {
+      consolePrintln("Internal temperature sensor read failed");
+    }
   }
 }
