@@ -38,7 +38,7 @@ jobs:
             --fqbn esp32:esp32:esp32c6:CDCOnBoot=cdc,PartitionScheme=no_fs \
             --build-property compiler.c.extra_flags="-flto -DCORE_DEBUG_LEVEL=5" \
             --build-property compiler.cpp.extra_flags="-flto -DCORE_DEBUG_LEVEL=5" \
-            --build-property compiler.S.extra_flags="-flto" \
+            --build-property compiler.S.extra_flags="-flto" -DCORE_DEBUG_LEVEL=5" \
             --build-property compiler.c.elf.extra_flags="-flto" \
             blinky
 
