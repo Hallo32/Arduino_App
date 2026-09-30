@@ -94,6 +94,7 @@ class BleUartRxCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *characteristic) override {
     const uint8_t *data = characteristic->getData();
     const size_t length = characteristic->getLength();
+    consolePrintf("BLE UART RX write: %u bytes\n", static_cast<unsigned>(length));
 
     for (size_t index = 0; index < length; ++index) {
       const char value = static_cast<char>(data[index]);
@@ -127,6 +128,35 @@ class BleUartRxCallbacks : public BLECharacteristicCallbacks {
  private:
   char line_[64]{};
   size_t lineLength_ = 0;
+};
+
+class BleUartTxCallbacks : public BLECharacteristicCallbacks {
+ public:
+  void onStatus(BLECharacteristic *, Status status, uint32_t code) override {
+    if (status == SUCCESS_NOTIFY) {
+      return;
+    }
+
+    consolePrintf("BLE UART TX notification status=%u code=%lu (0x%08lX)\n",
+                  static_cast<unsigned>(status),
+                  static_cast<unsigned long>(code),
+                  static_cast<unsigned long>(code));
+  }
+};
+
+class BleServerDebugCallbacks : public BLEServerCallbacks {
+ public:
+  void onConnect(BLEServer *server) override {
+    consolePrintf("BLE client connected; clients=%lu, local MTU=%u\n",
+                  static_cast<unsigned long>(server->getConnectedCount()),
+                  BLEDevice::getMTU());
+  }
+
+  void onDisconnect(BLEServer *server) override {
+    consolePrintf("BLE client disconnected; clients=%lu\n",
+                  static_cast<unsigned long>(server->getConnectedCount()));
+    BLEDevice::startAdvertising();
+  }
 };
 
 void checkForFirmwareUpdate();
@@ -184,6 +214,7 @@ void startBleUart() {
   }
 
   bleServer = BLEDevice::createServer();
+  bleServer->setCallbacks(new BleServerDebugCallbacks());
   BLEService *service = bleServer->createService(BLE_UART_SERVICE_UUID);
   BLECharacteristic *rxCharacteristic = service->createCharacteristic(
       BLE_UART_RX_UUID,
@@ -193,6 +224,7 @@ void startBleUart() {
   bleTxCharacteristic = service->createCharacteristic(
       BLE_UART_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
   bleTxCharacteristic->setValue("");
+  bleTxCharacteristic->setCallbacks(new BleUartTxCallbacks());
 
   service->start();
   BLEAdvertising *advertising = BLEDevice::getAdvertising();
