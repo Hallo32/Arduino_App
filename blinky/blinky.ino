@@ -10,6 +10,7 @@
 #include <WiFiClientSecure.h>
 #include <math.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -57,13 +58,12 @@ constexpr uint32_t TEMPERATURE_INTERVAL_MS =
 constexpr time_t VALID_TIME_THRESHOLD =
     1700000000;
 
-
 constexpr char GERMAN_TIME_ZONE[] =
     "CET-1CEST,M3.5.0/2,M10.5.0/3";
 
 
 // ============================================================================
-// State
+// Application state
 // ============================================================================
 
 enum class ProvisioningState : uint8_t {
@@ -103,7 +103,8 @@ ProvisioningState provisioningState =
 // BLE state
 // ============================================================================
 
-BLEServer *bleServer = nullptr;
+BLEServer *bleServer =
+    nullptr;
 
 BLECharacteristic *bleTxCharacteristic =
     nullptr;
@@ -113,20 +114,31 @@ QueueHandle_t bleCommandQueue =
 
 
 /*
- * This flag is deliberately used instead of relying only on
- * getConnectedCount().
+ * True if at least one BLE client has enabled notifications
+ * on the TX characteristic.
  *
- * A connected BLE client does not necessarily have notifications
- * enabled for the TX characteristic.
- *
- * Calling notify() without a subscriber results in
- * ERROR_NO_SUBSCRIBER (Status == 6).
- *
- * More importantly, we do NOT install an onStatus() callback here.
- * Such a callback must never call consolePrintf(), because
- * consolePrintf() can itself call notify() and re-enter NimBLE.
+ * This is intentionally only accessed from the BLE subscription
+ * callback and from loop()/sendBleText().
  */
-volatile bool bleTxSubscribed = false;
+volatile bool bleTxSubscribed =
+    false;
+
+
+// ============================================================================
+// BLE command queue
+// ============================================================================
+
+/*
+ * BLE callbacks execute in the NimBLE host context.
+ *
+ * They must therefore NOT call consolePrintf(), because that function
+ * can call notify(), which enters BLE again.
+ *
+ * Commands are copied into this structure and put into a FreeRTOS queue.
+ */
+struct BleCommand {
+  char text[65];
+};
 
 
 // ============================================================================
@@ -137,26 +149,34 @@ void sendBleText(
     const char *text,
     size_t length) {
 
-  if (text == nullptr ||
+  if (
+      text == nullptr ||
       length == 0) {
 
     return;
   }
 
 
-  if (bleTxCharacteristic == nullptr ||
+  if (
+      bleTxCharacteristic == nullptr ||
       bleServer == nullptr) {
 
     return;
   }
 
 
-  if (bleServer->getConnectedCount() == 0) {
+  if (
+      bleServer->getConnectedCount() == 0) {
 
     return;
   }
 
 
+  /*
+   * PROPERTY_NOTIFY alone does not mean that a client has subscribed.
+   *
+   * Do not call notify() when nobody is subscribed.
+   */
   if (!bleTxSubscribed) {
 
     return;
@@ -164,11 +184,11 @@ void sendBleText(
 
 
   /*
-   * Keep packets at 20 bytes.
-   *
-   * This avoids depending on a negotiated ATT MTU.
+   * Keep packets at 20 bytes so that this works with clients
+   * without requiring a larger negotiated MTU.
    */
-  constexpr size_t BLE_CHUNK_SIZE = 20;
+  constexpr size_t BLE_CHUNK_SIZE =
+      20;
 
 
   for (
@@ -189,19 +209,15 @@ void sendBleText(
 
 
     /*
-     * IMPORTANT:
+     * There is intentionally NO onStatus() callback.
      *
-     * No BLE callback is installed on this characteristic.
-     *
-     * Therefore notify() cannot recursively call our own
-     * logging code.
+     * In the previous implementation onStatus() called
+     * consolePrintf(), which called sendBleText(), which called
+     * notify() again and caused recursive entry into NimBLE.
      */
     bleTxCharacteristic->notify();
 
 
-    /*
-     * Give NimBLE some time between packets.
-     */
     delay(10);
   }
 }
@@ -290,7 +306,7 @@ void consolePrintf(
 
 
 // ============================================================================
-// BLE RX callback
+// BLE UART RX callback
 // ============================================================================
 
 class BleUartRxCallbacks
@@ -316,7 +332,8 @@ class BleUartRxCallbacks
         characteristic->getLength();
 
 
-    if (data == nullptr ||
+    if (
+        data == nullptr ||
         length == 0) {
 
       return;
@@ -326,15 +343,11 @@ class BleUartRxCallbacks
     /*
      * IMPORTANT:
      *
-     * Do NOT call consolePrintf() here.
+     * No Serial output here.
+     * No BLE notification here.
+     * No consolePrintf() here.
      *
-     * This function executes in the NimBLE host context.
-     * consolePrintf() can call notify(), which would enter
-     * NimBLE again.
-     *
-     * Instead we only collect the command and put it into
-     * a FreeRTOS queue. The command is processed later
-     * from loop().
+     * We only collect the command and enqueue it.
      */
 
     for (
@@ -353,34 +366,34 @@ class BleUartRxCallbacks
       }
 
 
-      if (value == '\n' ||
-          value == 0x03) {
+      /*
+       * Newline terminates the command.
+       */
+      if (value == '\n') {
+
+        enqueueCurrentLine();
+
+        continue;
+      }
+
+
+      /*
+       * Ctrl+C cancels Wi-Fi provisioning.
+       */
+      if (value == 0x03) {
 
         BleCommand command{};
 
 
-        if (value == 0x03) {
+        command.text[0] =
+            0x03;
 
-          command.text[0] =
-              value;
-
-          command.text[1] =
-              '\0';
-
-        } else {
-
-          memcpy(
-              command.text,
-              line_,
-              lineLength_);
+        command.text[1] =
+            '\0';
 
 
-          command.text[lineLength_] =
-              '\0';
-        }
-
-
-        if (bleCommandQueue != nullptr) {
+        if (
+            bleCommandQueue != nullptr) {
 
           xQueueSend(
               bleCommandQueue,
@@ -397,6 +410,9 @@ class BleUartRxCallbacks
       }
 
 
+      /*
+       * Collect characters until the maximum command size.
+       */
       if (
           lineLength_ <
           sizeof(line_) - 1) {
@@ -407,8 +423,8 @@ class BleUartRxCallbacks
       } else {
 
         /*
-         * Overflow:
-         * discard the current line.
+         * Command too long.
+         * Discard it.
          */
         lineLength_ =
             0;
@@ -418,6 +434,36 @@ class BleUartRxCallbacks
 
 
  private:
+
+  void enqueueCurrentLine() {
+
+    BleCommand command{};
+
+
+    memcpy(
+        command.text,
+        line_,
+        lineLength_);
+
+
+    command.text[lineLength_] =
+        '\0';
+
+
+    if (
+        bleCommandQueue != nullptr) {
+
+      xQueueSend(
+          bleCommandQueue,
+          &command,
+          0);
+    }
+
+
+    lineLength_ =
+        0;
+  }
+
 
   char line_[64]{};
 
@@ -435,6 +481,18 @@ class BleUartSubscriptionCallbacks
 
  public:
 
+  /*
+   * This callback exists only with NimBLE.
+   *
+   * Core 3.3.12 declares:
+   *
+   * virtual void onSubscribe(
+   *     BLECharacteristic *pCharacteristic,
+   *     ble_gap_conn_desc *desc,
+   *     uint16_t subValue);
+   */
+#if defined(CONFIG_NIMBLE_ENABLED)
+
   void onSubscribe(
       BLECharacteristic *,
       ble_gap_conn_desc *,
@@ -442,16 +500,13 @@ class BleUartSubscriptionCallbacks
       override {
 
     /*
-     * NimBLE CCCD:
-     *
-     * bit 0 = notifications
-     * bit 1 = indications
-     *
-     * We only use notifications.
+     * Bit 0 = notifications.
      */
     bleTxSubscribed =
         (subValue & 0x0001U) != 0;
   }
+
+#endif
 };
 
 
@@ -459,10 +514,51 @@ class BleUartSubscriptionCallbacks
 // BLE server callbacks
 // ============================================================================
 
-class BleServerCallbacksImpl
+class BleServerDebugCallbacks
     : public BLEServerCallbacks {
 
  public:
+
+  /*
+   * Common callback.
+   *
+   * For NimBLE the detailed callback below is used.
+   *
+   * No BLE output is performed here.
+   */
+  void onConnect(
+      BLEServer *)
+      override {
+
+#if !defined(CONFIG_NIMBLE_ENABLED)
+
+    Serial.println(
+        "BLE client connected");
+
+#endif
+  }
+
+
+  void onDisconnect(
+      BLEServer *)
+      override {
+
+#if !defined(CONFIG_NIMBLE_ENABLED)
+
+    Serial.println(
+        "BLE client disconnected");
+
+    BLEDevice::startAdvertising();
+
+#endif
+  }
+
+
+#if defined(CONFIG_NIMBLE_ENABLED)
+
+  // --------------------------------------------------------------------------
+  // NimBLE connect callback
+  // --------------------------------------------------------------------------
 
   void onConnect(
       BLEServer *server,
@@ -470,10 +566,12 @@ class BleServerCallbacksImpl
       override {
 
     /*
-     * Only use Serial here.
+     * IMPORTANT:
      *
-     * Do not use consolePrintf() because that would potentially
-     * invoke BLE notify() from inside the NimBLE host task.
+     * Only Serial is used here.
+     *
+     * This callback runs in the NimBLE host task.
+     * consolePrintf() would call notify() and re-enter NimBLE.
      */
 
     Serial.println();
@@ -482,68 +580,84 @@ class BleServerCallbacksImpl
         "========== BLE CONNECT ==========");
 
 
-    if (desc != nullptr) {
+    if (desc == nullptr) {
 
       Serial.printf(
-          "handle       : %u\n",
-          static_cast<unsigned>(
-              desc->conn_handle));
+          "clients      : %lu\n",
+          static_cast<unsigned long>(
+              server->getConnectedCount()));
 
 
-      Serial.printf(
-          "interval     : %u (%.2f ms)\n",
-          static_cast<unsigned>(
-              desc->conn_itvl),
-          desc->conn_itvl * 1.25);
+      Serial.println(
+          "descriptor   : unavailable");
 
 
-      Serial.printf(
-          "latency      : %u\n",
-          static_cast<unsigned>(
-              desc->conn_latency));
+      Serial.println(
+          "=================================");
 
 
-      Serial.printf(
-          "timeout      : %u (%u ms)\n",
-          static_cast<unsigned>(
-              desc->supervision_timeout),
-          static_cast<unsigned>(
-              desc->supervision_timeout * 10));
-
-
-      Serial.printf(
-          "encrypted    : %s\n",
-          desc->sec_state.encrypted
-              ? "yes"
-              : "no");
-
-
-      Serial.printf(
-          "authenticated: %s\n",
-          desc->sec_state.authenticated
-              ? "yes"
-              : "no");
-
-
-      Serial.printf(
-          "bonded       : %s\n",
-          desc->sec_state.bonded
-              ? "yes"
-              : "no");
-
-
-      Serial.printf(
-          "local MTU    : %u\n",
-          static_cast<unsigned>(
-              BLEDevice::getMTU()));
-
-
-      Serial.printf(
-          "peer MTU     : %u\n",
-          static_cast<unsigned>(
-              server->getPeerMTU(
-                  desc->conn_handle)));
+      return;
     }
+
+
+    Serial.printf(
+        "handle       : %u\n",
+        static_cast<unsigned>(
+            desc->conn_handle));
+
+
+    Serial.printf(
+        "interval     : %u (%.2f ms)\n",
+        static_cast<unsigned>(
+            desc->conn_itvl),
+        desc->conn_itvl * 1.25);
+
+
+    Serial.printf(
+        "latency      : %u\n",
+        static_cast<unsigned>(
+            desc->conn_latency));
+
+
+    Serial.printf(
+        "timeout      : %u (%u ms)\n",
+        static_cast<unsigned>(
+            desc->supervision_timeout),
+        static_cast<unsigned>(
+            desc->supervision_timeout * 10));
+
+
+    Serial.printf(
+        "encrypted    : %s\n",
+        desc->sec_state.encrypted
+            ? "yes"
+            : "no");
+
+
+    Serial.printf(
+        "authenticated: %s\n",
+        desc->sec_state.authenticated
+            ? "yes"
+            : "no");
+
+
+    Serial.printf(
+        "bonded       : %s\n",
+        desc->sec_state.bonded
+            ? "yes"
+            : "no");
+
+
+    Serial.printf(
+        "local MTU    : %u\n",
+        static_cast<unsigned>(
+            BLEDevice::getMTU()));
+
+
+    Serial.printf(
+        "clients      : %lu\n",
+        static_cast<unsigned long>(
+            server->getConnectedCount()));
 
 
     Serial.println(
@@ -551,13 +665,17 @@ class BleServerCallbacksImpl
   }
 
 
+  // --------------------------------------------------------------------------
+  // NimBLE disconnect callback
+  // --------------------------------------------------------------------------
+
   void onDisconnect(
-      BLEServer *,
+      BLEServer *server,
       ble_gap_conn_desc *desc)
       override {
 
     /*
-     * Reset subscription state BEFORE restarting advertising.
+     * Reset notification state first.
      */
     bleTxSubscribed =
         false;
@@ -617,15 +735,24 @@ class BleServerCallbacksImpl
           desc->sec_state.bonded
               ? "yes"
               : "no");
+
+
+      Serial.printf(
+          "clients      : %lu\n",
+          static_cast<unsigned long>(
+              server->getConnectedCount()));
+
+    } else {
+
+      Serial.println(
+          "connection descriptor unavailable");
     }
 
 
     /*
-     * The actual GAP disconnect reason is not contained
-     * in ble_gap_conn_desc.
+     * ble_gap_conn_desc does NOT contain the GAP disconnect reason.
      *
-     * NimBLE/Arduino-ESP32 prints that information through
-     * its own debug logging.
+     * The NimBLE/Arduino-ESP32 debug output provides that reason.
      */
     Serial.println(
         "Disconnect reason is provided by "
@@ -636,43 +763,13 @@ class BleServerCallbacksImpl
         "=================================");
 
 
-    /*
-     * Start advertising again after the client disconnects.
-     */
     BLEDevice::startAdvertising();
   }
 
 
-  void onMtuChanged(
-      BLEServer *server,
-      ble_gap_conn_desc *desc,
-      uint16_t mtu)
-      override {
-
-    /*
-     * Serial only.
-     */
-    Serial.printf(
-        "BLE MTU CHANGED: "
-        "handle=%u, "
-        "mtu=%u, "
-        "peer MTU=%u\n",
-
-        desc != nullptr
-            ? static_cast<unsigned>(
-                  desc->conn_handle)
-            : 0U,
-
-        static_cast<unsigned>(
-            mtu),
-
-        desc != nullptr
-            ? static_cast<unsigned>(
-                  server->getPeerMTU(
-                      desc->conn_handle))
-            : 0U);
-  }
-
+  // --------------------------------------------------------------------------
+  // NimBLE connection parameter callback
+  // --------------------------------------------------------------------------
 
   void onConnParamsUpdate(
       uint16_t conn_handle,
@@ -713,6 +810,33 @@ class BleServerCallbacksImpl
         static_cast<unsigned>(
             status));
   }
+
+
+  // --------------------------------------------------------------------------
+  // NimBLE MTU callback
+  // --------------------------------------------------------------------------
+
+  void onMtuChanged(
+      BLEServer *,
+      ble_gap_conn_desc *desc,
+      uint16_t mtu)
+      override {
+
+    Serial.printf(
+        "BLE MTU UPDATE: "
+        "handle=%u, "
+        "mtu=%u\n",
+
+        desc != nullptr
+            ? static_cast<unsigned>(
+                  desc->conn_handle)
+            : 0U,
+
+        static_cast<unsigned>(
+            mtu));
+  }
+
+#endif
 };
 
 
@@ -860,10 +984,6 @@ String createDeviceHostname() {
 
 void startBleUart() {
 
-  /*
-   * BLEDevice::init() is a valid bool-returning API
-   * in Arduino-ESP32 3.3.12.
-   */
   if (
       !BLEDevice::init(
           deviceHostname)) {
@@ -886,6 +1006,9 @@ void startBleUart() {
           BLEDevice::getMTU()));
 
 
+  /*
+   * Queue is created BEFORE the callbacks can receive data.
+   */
   bleCommandQueue =
       xQueueCreate(
           4,
@@ -916,7 +1039,7 @@ void startBleUart() {
 
 
   bleServer->setCallbacks(
-      new BleServerCallbacksImpl());
+      new BleServerDebugCallbacks());
 
 
   BLEService *service =
@@ -932,6 +1055,10 @@ void startBleUart() {
     return;
   }
 
+
+  // --------------------------------------------------------------------------
+  // RX
+  // --------------------------------------------------------------------------
 
   BLECharacteristic *rxCharacteristic =
       service->createCharacteristic(
@@ -953,6 +1080,10 @@ void startBleUart() {
       new BleUartRxCallbacks());
 
 
+  // --------------------------------------------------------------------------
+  // TX
+  // --------------------------------------------------------------------------
+
   bleTxCharacteristic =
       service->createCharacteristic(
           BLE_UART_TX_UUID,
@@ -973,26 +1104,22 @@ void startBleUart() {
 
 
   /*
-   * Only the subscription callback is installed.
+   * IMPORTANT:
    *
-   * There is deliberately NO onStatus() callback.
+   * We use onSubscribe(), NOT onStatus().
+   *
+   * There is deliberately no callback which logs notification
+   * errors via consolePrintf().
    */
   bleTxCharacteristic->setCallbacks(
       new BleUartSubscriptionCallbacks());
 
 
   /*
-   * With NimBLE, the CCCD required for NOTIFY is handled
-   * automatically for PROPERTY_NOTIFY.
+   * With NimBLE the CCCD required for NOTIFY is created from
+   * PROPERTY_NOTIFY.
    */
-  if (
-      !service->start()) {
-
-    Serial.println(
-        "BLE UART service start failed");
-
-    return;
-  }
+  service->start();
 
 
   BLEAdvertising *advertising =
@@ -1047,6 +1174,9 @@ void processBleCommands() {
           &command,
           0) == pdTRUE) {
 
+    /*
+     * Ctrl+C.
+     */
     if (
         static_cast<uint8_t>(
             command.text[0]) == 0x03) {
@@ -1842,10 +1972,6 @@ void checkForFirmwareUpdate() {
               percent;
 
 
-          /*
-           * This callback is NOT a BLE callback.
-           * consolePrintf() is therefore safe here.
-           */
           consolePrintf(
               "OTA progress: %d%%\n",
               percent);
@@ -1909,9 +2035,6 @@ void setup() {
       115200);
 
 
-  /*
-   * German time zone including daylight saving time.
-   */
   setenv(
       "TZ",
       GERMAN_TIME_ZONE,
@@ -1967,14 +2090,15 @@ void setup() {
 void loop() {
 
   /*
-   * Serial processing happens from loop().
+   * Serial input is handled in the Arduino loop task.
    */
   handleSerialInput();
 
 
   /*
-   * BLE commands are also processed from loop(),
-   * never directly from the NimBLE callback.
+   * BLE commands are also handled in loop().
+   *
+   * The NimBLE callback only puts the command into the queue.
    */
   processBleCommands();
 
@@ -2065,8 +2189,5 @@ void loop() {
   }
 
 
-  /*
-   * Small yield for FreeRTOS.
-   */
   delay(1);
 }
