@@ -8,12 +8,16 @@
 #include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_log.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+#if defined(CONFIG_NIMBLE_ENABLED)
+#include "host/ble_gap.h"
+#endif
 
 // ============================================================================
 // Configuration
@@ -28,7 +32,6 @@ constexpr char FIRMWARE_ASSET_NAME[] =
 constexpr char DEVICE_HOSTNAME_PREFIX[] =
     "ESP32-C6-";
 
-
 constexpr char BLE_UART_SERVICE_UUID[] =
     "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
 
@@ -38,13 +41,11 @@ constexpr char BLE_UART_RX_UUID[] =
 constexpr char BLE_UART_TX_UUID[] =
     "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 
-
 constexpr char WIFI_NAMESPACE[] =
     "wifi";
 
 constexpr char OTA_NAMESPACE[] =
     "ota";
-
 
 constexpr uint32_t BLINK_INTERVAL_MS =
     500;
@@ -61,7 +62,6 @@ constexpr time_t VALID_TIME_THRESHOLD =
 constexpr char GERMAN_TIME_ZONE[] =
     "CET-1CEST,M3.5.0/2,M10.5.0/3";
 
-
 // ============================================================================
 // Application state
 // ============================================================================
@@ -72,74 +72,55 @@ enum class ProvisioningState : uint8_t {
   WaitingForPassword
 };
 
-
 bool ledState = false;
-
 bool otaCheckComplete = false;
 
 uint32_t lastLedToggle = 0;
-
 uint32_t lastTemperatureSent = 0;
 
-
 String wifiSsid;
-
 String wifiPassword;
-
 String installedReleaseTag;
-
 String deviceHostname;
 
 String pendingSsid;
-
 String serialLine;
-
 
 ProvisioningState provisioningState =
     ProvisioningState::Idle;
-
 
 // ============================================================================
 // BLE state
 // ============================================================================
 
-BLEServer *bleServer =
-    nullptr;
+BLEServer *bleServer = nullptr;
+BLECharacteristic *bleTxCharacteristic = nullptr;
 
-BLECharacteristic *bleTxCharacteristic =
-    nullptr;
-
-QueueHandle_t bleCommandQueue =
-    nullptr;
-
+QueueHandle_t bleCommandQueue = nullptr;
 
 /*
- * True if at least one BLE client has enabled notifications
- * on the TX characteristic.
+ * True if a BLE client has enabled notifications on the TX characteristic.
  *
- * This is intentionally only accessed from the BLE subscription
- * callback and from loop()/sendBleText().
+ * IMPORTANT:
+ * This flag is only changed by the BLE subscription callback and reset
+ * by the BLE disconnect callback.
  */
-volatile bool bleTxSubscribed =
-    false;
-
+volatile bool bleTxSubscribed = false;
 
 // ============================================================================
 // BLE command queue
 // ============================================================================
 
 /*
- * BLE callbacks execute in the NimBLE host context.
+ * BLE callbacks execute in the NimBLE host task.
  *
- * They must therefore NOT call consolePrintf(), because that function
- * can call notify(), which enters BLE again.
- *
- * Commands are copied into this structure and put into a FreeRTOS queue.
+ * They must NOT call consolePrintf(), because consolePrintf() can call
+ * notify(), which would re-enter NimBLE and can overflow the NimBLE host
+ * stack.
  */
 struct BleCommand {
   char text[65];
 };
-
 
 // ============================================================================
 // BLE output
@@ -156,7 +137,6 @@ void sendBleText(
     return;
   }
 
-
   if (
       bleTxCharacteristic == nullptr ||
       bleServer == nullptr) {
@@ -164,32 +144,25 @@ void sendBleText(
     return;
   }
 
-
   if (
       bleServer->getConnectedCount() == 0) {
 
     return;
   }
 
-
   /*
-   * PROPERTY_NOTIFY alone does not mean that a client has subscribed.
-   *
-   * Do not call notify() when nobody is subscribed.
+   * Never notify unless the client actually subscribed.
    */
   if (!bleTxSubscribed) {
 
     return;
   }
 
-
   /*
-   * Keep packets at 20 bytes so that this works with clients
-   * without requiring a larger negotiated MTU.
+   * Keep packets at 20 bytes.
+   * This works with the default ATT MTU of 23.
    */
-  constexpr size_t BLE_CHUNK_SIZE =
-      20;
-
+  constexpr size_t BLE_CHUNK_SIZE = 20;
 
   for (
       size_t offset = 0;
@@ -201,27 +174,28 @@ void sendBleText(
             BLE_CHUNK_SIZE,
             length - offset);
 
-
     bleTxCharacteristic->setValue(
         reinterpret_cast<const uint8_t *>(
             text + offset),
         chunkLength);
 
-
     /*
-     * There is intentionally NO onStatus() callback.
+     * IMPORTANT:
      *
-     * In the previous implementation onStatus() called
-     * consolePrintf(), which called sendBleText(), which called
-     * notify() again and caused recursive entry into NimBLE.
+     * There is deliberately NO onStatus() callback.
+     *
+     * The previous implementation recursively called consolePrintf()
+     * from the BLE notification callback. That caused re-entry into
+     * NimBLE and eventually:
+     *
+     * Guru Meditation Error: Core 0
+     * Stack protection fault
      */
     bleTxCharacteristic->notify();
-
 
     delay(10);
   }
 }
-
 
 // ============================================================================
 // Console output
@@ -231,44 +205,35 @@ void consolePrintln(
     const char *text) {
 
   if (text == nullptr) {
-
     return;
   }
 
-
   Serial.println(text);
-
 
   sendBleText(
       text,
       strlen(text));
-
 
   sendBleText(
       "\r\n",
       2);
 }
 
-
 void consolePrintf(
     const char *format,
     ...) {
 
   if (format == nullptr) {
-
     return;
   }
 
-
   char buffer[256];
-
 
   va_list arguments;
 
   va_start(
       arguments,
       format);
-
 
   const int length =
       vsnprintf(
@@ -277,33 +242,26 @@ void consolePrintf(
           format,
           arguments);
 
-
   va_end(arguments);
 
-
   if (length <= 0) {
-
     return;
   }
-
 
   const size_t outputLength =
       min(
           static_cast<size_t>(length),
           sizeof(buffer) - 1);
 
-
   Serial.write(
       reinterpret_cast<const uint8_t *>(
           buffer),
       outputLength);
 
-
   sendBleText(
       buffer,
       outputLength);
 }
-
 
 // ============================================================================
 // BLE UART RX callback
@@ -319,18 +277,14 @@ class BleUartRxCallbacks
       override {
 
     if (characteristic == nullptr) {
-
       return;
     }
-
 
     const uint8_t *data =
         characteristic->getData();
 
-
     const size_t length =
         characteristic->getLength();
-
 
     if (
         data == nullptr ||
@@ -339,17 +293,11 @@ class BleUartRxCallbacks
       return;
     }
 
-
     /*
-     * IMPORTANT:
+     * Do NOT use Serial/BLE output here.
      *
-     * No Serial output here.
-     * No BLE notification here.
-     * No consolePrintf() here.
-     *
-     * We only collect the command and enqueue it.
+     * This callback runs in the NimBLE host context.
      */
-
     for (
         size_t index = 0;
         index < length;
@@ -359,16 +307,10 @@ class BleUartRxCallbacks
           static_cast<char>(
               data[index]);
 
-
       if (value == '\r') {
-
         continue;
       }
 
-
-      /*
-       * Newline terminates the command.
-       */
       if (value == '\n') {
 
         enqueueCurrentLine();
@@ -376,21 +318,12 @@ class BleUartRxCallbacks
         continue;
       }
 
-
-      /*
-       * Ctrl+C cancels Wi-Fi provisioning.
-       */
       if (value == 0x03) {
 
         BleCommand command{};
 
-
-        command.text[0] =
-            0x03;
-
-        command.text[1] =
-            '\0';
-
+        command.text[0] = 0x03;
+        command.text[1] = '\0';
 
         if (
             bleCommandQueue != nullptr) {
@@ -401,18 +334,11 @@ class BleUartRxCallbacks
               0);
         }
 
-
-        lineLength_ =
-            0;
-
+        lineLength_ = 0;
 
         continue;
       }
 
-
-      /*
-       * Collect characters until the maximum command size.
-       */
       if (
           lineLength_ <
           sizeof(line_) - 1) {
@@ -426,12 +352,10 @@ class BleUartRxCallbacks
          * Command too long.
          * Discard it.
          */
-        lineLength_ =
-            0;
+        lineLength_ = 0;
       }
     }
   }
-
 
  private:
 
@@ -439,16 +363,13 @@ class BleUartRxCallbacks
 
     BleCommand command{};
 
-
     memcpy(
         command.text,
         line_,
         lineLength_);
 
-
     command.text[lineLength_] =
         '\0';
-
 
     if (
         bleCommandQueue != nullptr) {
@@ -459,18 +380,13 @@ class BleUartRxCallbacks
           0);
     }
 
-
-    lineLength_ =
-        0;
+    lineLength_ = 0;
   }
-
 
   char line_[64]{};
 
-  size_t lineLength_ =
-      0;
+  size_t lineLength_ = 0;
 };
-
 
 // ============================================================================
 // BLE TX subscription callback
@@ -481,34 +397,55 @@ class BleUartSubscriptionCallbacks
 
  public:
 
+#if defined(CONFIG_NIMBLE_ENABLED)
+
   /*
-   * This callback exists only with NimBLE.
-   *
-   * Core 3.3.12 declares:
+   * Arduino-ESP32 Core 3.3.12 / NimBLE:
    *
    * virtual void onSubscribe(
    *     BLECharacteristic *pCharacteristic,
    *     ble_gap_conn_desc *desc,
    *     uint16_t subValue);
    */
-#if defined(CONFIG_NIMBLE_ENABLED)
-
   void onSubscribe(
       BLECharacteristic *,
-      ble_gap_conn_desc *,
+      ble_gap_conn_desc *desc,
       uint16_t subValue)
       override {
 
     /*
-     * Bit 0 = notifications.
+     * Bit 0 = notifications
+     * Bit 1 = indications
      */
     bleTxSubscribed =
         (subValue & 0x0001U) != 0;
+
+    Serial.printf(
+        "BLE SUBSCRIBE: "
+        "handle=%u, "
+        "subValue=0x%04X, "
+        "notify=%s, "
+        "indicate=%s\n",
+
+        desc != nullptr
+            ? static_cast<unsigned>(
+                  desc->conn_handle)
+            : 0U,
+
+        static_cast<unsigned>(
+            subValue),
+
+        (subValue & 0x0001U)
+            ? "yes"
+            : "no",
+
+        (subValue & 0x0002U)
+            ? "yes"
+            : "no");
   }
 
 #endif
 };
-
 
 // ============================================================================
 // BLE server callbacks
@@ -519,13 +456,6 @@ class BleServerDebugCallbacks
 
  public:
 
-  /*
-   * Common callback.
-   *
-   * For NimBLE the detailed callback below is used.
-   *
-   * No BLE output is performed here.
-   */
   void onConnect(
       BLEServer *)
       override {
@@ -537,7 +467,6 @@ class BleServerDebugCallbacks
 
 #endif
   }
-
 
   void onDisconnect(
       BLEServer *)
@@ -553,11 +482,10 @@ class BleServerDebugCallbacks
 #endif
   }
 
-
 #if defined(CONFIG_NIMBLE_ENABLED)
 
   // --------------------------------------------------------------------------
-  // NimBLE connect callback
+  // NimBLE connect
   // --------------------------------------------------------------------------
 
   void onConnect(
@@ -565,20 +493,10 @@ class BleServerDebugCallbacks
       ble_gap_conn_desc *desc)
       override {
 
-    /*
-     * IMPORTANT:
-     *
-     * Only Serial is used here.
-     *
-     * This callback runs in the NimBLE host task.
-     * consolePrintf() would call notify() and re-enter NimBLE.
-     */
-
     Serial.println();
 
     Serial.println(
         "========== BLE CONNECT ==========");
-
 
     if (desc == nullptr) {
 
@@ -587,24 +505,19 @@ class BleServerDebugCallbacks
           static_cast<unsigned long>(
               server->getConnectedCount()));
 
-
       Serial.println(
           "descriptor   : unavailable");
-
 
       Serial.println(
           "=================================");
 
-
       return;
     }
-
 
     Serial.printf(
         "handle       : %u\n",
         static_cast<unsigned>(
             desc->conn_handle));
-
 
     Serial.printf(
         "interval     : %u (%.2f ms)\n",
@@ -612,12 +525,10 @@ class BleServerDebugCallbacks
             desc->conn_itvl),
         desc->conn_itvl * 1.25);
 
-
     Serial.printf(
         "latency      : %u\n",
         static_cast<unsigned>(
             desc->conn_latency));
-
 
     Serial.printf(
         "timeout      : %u (%u ms)\n",
@@ -626,13 +537,11 @@ class BleServerDebugCallbacks
         static_cast<unsigned>(
             desc->supervision_timeout * 10));
 
-
     Serial.printf(
         "encrypted    : %s\n",
         desc->sec_state.encrypted
             ? "yes"
             : "no");
-
 
     Serial.printf(
         "authenticated: %s\n",
@@ -640,33 +549,28 @@ class BleServerDebugCallbacks
             ? "yes"
             : "no");
 
-
     Serial.printf(
         "bonded       : %s\n",
         desc->sec_state.bonded
             ? "yes"
             : "no");
 
-
     Serial.printf(
         "local MTU    : %u\n",
         static_cast<unsigned>(
             BLEDevice::getMTU()));
-
 
     Serial.printf(
         "clients      : %lu\n",
         static_cast<unsigned long>(
             server->getConnectedCount()));
 
-
     Serial.println(
         "=================================");
   }
 
-
   // --------------------------------------------------------------------------
-  // NimBLE disconnect callback
+  // NimBLE disconnect
   // --------------------------------------------------------------------------
 
   void onDisconnect(
@@ -675,17 +579,14 @@ class BleServerDebugCallbacks
       override {
 
     /*
-     * Reset notification state first.
+     * The client is no longer allowed to receive notifications.
      */
-    bleTxSubscribed =
-        false;
-
+    bleTxSubscribed = false;
 
     Serial.println();
 
     Serial.println(
         "======== BLE DISCONNECT =========");
-
 
     if (desc != nullptr) {
 
@@ -694,19 +595,16 @@ class BleServerDebugCallbacks
           static_cast<unsigned>(
               desc->conn_handle));
 
-
       Serial.printf(
           "interval     : %u (%.2f ms)\n",
           static_cast<unsigned>(
               desc->conn_itvl),
           desc->conn_itvl * 1.25);
 
-
       Serial.printf(
           "latency      : %u\n",
           static_cast<unsigned>(
               desc->conn_latency));
-
 
       Serial.printf(
           "timeout      : %u (%u ms)\n",
@@ -715,13 +613,11 @@ class BleServerDebugCallbacks
           static_cast<unsigned>(
               desc->supervision_timeout * 10));
 
-
       Serial.printf(
           "encrypted    : %s\n",
           desc->sec_state.encrypted
               ? "yes"
               : "no");
-
 
       Serial.printf(
           "authenticated: %s\n",
@@ -729,13 +625,11 @@ class BleServerDebugCallbacks
               ? "yes"
               : "no");
 
-
       Serial.printf(
           "bonded       : %s\n",
           desc->sec_state.bonded
               ? "yes"
               : "no");
-
 
       Serial.printf(
           "clients      : %lu\n",
@@ -748,27 +642,27 @@ class BleServerDebugCallbacks
           "connection descriptor unavailable");
     }
 
-
     /*
      * ble_gap_conn_desc does NOT contain the GAP disconnect reason.
      *
-     * The NimBLE/Arduino-ESP32 debug output provides that reason.
+     * The reason is part of the NimBLE GAP disconnect event.
+     * We therefore intentionally do not invent a reason here.
      */
     Serial.println(
         "Disconnect reason is provided by "
         "the NimBLE/Arduino-ESP32 debug log.");
 
-
     Serial.println(
         "=================================");
 
-
+    /*
+     * Restart advertising.
+     */
     BLEDevice::startAdvertising();
   }
 
-
   // --------------------------------------------------------------------------
-  // NimBLE connection parameter callback
+  // Connection parameter update
   // --------------------------------------------------------------------------
 
   void onConnParamsUpdate(
@@ -779,9 +673,6 @@ class BleServerDebugCallbacks
       uint8_t status)
       override {
 
-    /*
-     * Serial only.
-     */
     Serial.printf(
         "BLE CONN PARAMS: "
         "handle=%u, "
@@ -811,9 +702,8 @@ class BleServerDebugCallbacks
             status));
   }
 
-
   // --------------------------------------------------------------------------
-  // NimBLE MTU callback
+  // MTU update
   // --------------------------------------------------------------------------
 
   void onMtuChanged(
@@ -839,7 +729,6 @@ class BleServerDebugCallbacks
 #endif
 };
 
-
 // ============================================================================
 // Forward declarations
 // ============================================================================
@@ -851,7 +740,6 @@ void handleSerialLine(
 
 void cancelWifiProvisioning();
 
-
 // ============================================================================
 // Settings
 // ============================================================================
@@ -859,7 +747,6 @@ void cancelWifiProvisioning();
 void loadSettings() {
 
   Preferences preferences;
-
 
   if (
       preferences.begin(
@@ -871,16 +758,13 @@ void loadSettings() {
             "ssid",
             "");
 
-
     wifiPassword =
         preferences.getString(
             "password",
             "");
 
-
     preferences.end();
   }
-
 
   if (
       preferences.begin(
@@ -892,11 +776,9 @@ void loadSettings() {
             "tag",
             "");
 
-
     preferences.end();
   }
 }
-
 
 // ============================================================================
 // Wi-Fi
@@ -907,24 +789,19 @@ void connectToWifi() {
   WiFi.mode(
       WIFI_STA);
 
-
   WiFi.setHostname(
       deviceHostname.c_str());
 
-
   WiFi.setAutoReconnect(
       true);
-
 
   WiFi.begin(
       wifiSsid.c_str(),
       wifiPassword.c_str());
 
-
   consolePrintln(
       "Connecting to saved Wi-Fi network");
 }
-
 
 void startWifiProvisioning() {
 
@@ -932,24 +809,18 @@ void startWifiProvisioning() {
       false,
       false);
 
-
-  pendingSsid =
-      "";
-
+  pendingSsid = "";
 
   provisioningState =
       ProvisioningState::WaitingForSsid;
-
 
   consolePrintln(
       "Wi-Fi setup: existing credentials "
       "will be overwritten");
 
-
   consolePrintln(
       "Enter SSID in the serial monitor");
 }
-
 
 // ============================================================================
 // Hostname
@@ -960,9 +831,7 @@ String createDeviceHostname() {
   const uint64_t mac =
       ESP.getEfuseMac();
 
-
   char hostname[32];
-
 
   snprintf(
       hostname,
@@ -972,11 +841,9 @@ String createDeviceHostname() {
       static_cast<unsigned long long>(
           mac & 0xFFFFFFULL));
 
-
   return String(
       hostname);
 }
-
 
 // ============================================================================
 // BLE setup
@@ -994,7 +861,6 @@ void startBleUart() {
     return;
   }
 
-
   Serial.printf(
       "BLE initialized; "
       "stack=%s, "
@@ -1005,15 +871,13 @@ void startBleUart() {
       static_cast<unsigned>(
           BLEDevice::getMTU()));
 
-
   /*
-   * Queue is created BEFORE the callbacks can receive data.
+   * Create queue BEFORE the callbacks can receive data.
    */
   bleCommandQueue =
       xQueueCreate(
           4,
           sizeof(BleCommand));
-
 
   if (
       bleCommandQueue == nullptr) {
@@ -1024,10 +888,8 @@ void startBleUart() {
     return;
   }
 
-
   bleServer =
       BLEDevice::createServer();
-
 
   if (bleServer == nullptr) {
 
@@ -1037,15 +899,12 @@ void startBleUart() {
     return;
   }
 
-
   bleServer->setCallbacks(
       new BleServerDebugCallbacks());
-
 
   BLEService *service =
       bleServer->createService(
           BLE_UART_SERVICE_UUID);
-
 
   if (service == nullptr) {
 
@@ -1054,7 +913,6 @@ void startBleUart() {
 
     return;
   }
-
 
   // --------------------------------------------------------------------------
   // RX
@@ -1066,7 +924,6 @@ void startBleUart() {
           BLECharacteristic::PROPERTY_WRITE |
           BLECharacteristic::PROPERTY_WRITE_NR);
 
-
   if (rxCharacteristic == nullptr) {
 
     Serial.println(
@@ -1075,10 +932,8 @@ void startBleUart() {
     return;
   }
 
-
   rxCharacteristic->setCallbacks(
       new BleUartRxCallbacks());
-
 
   // --------------------------------------------------------------------------
   // TX
@@ -1089,7 +944,6 @@ void startBleUart() {
           BLE_UART_TX_UUID,
           BLECharacteristic::PROPERTY_NOTIFY);
 
-
   if (bleTxCharacteristic == nullptr) {
 
     Serial.println(
@@ -1098,33 +952,26 @@ void startBleUart() {
     return;
   }
 
-
-  bleTxCharacteristic->setValue(
-      "");
-
+  bleTxCharacteristic->setValue("");
 
   /*
    * IMPORTANT:
    *
    * We use onSubscribe(), NOT onStatus().
    *
-   * There is deliberately no callback which logs notification
-   * errors via consolePrintf().
+   * There is deliberately no callback that calls consolePrintf()
+   * from notification status handling.
    */
   bleTxCharacteristic->setCallbacks(
       new BleUartSubscriptionCallbacks());
 
-
   /*
-   * With NimBLE the CCCD required for NOTIFY is created from
-   * PROPERTY_NOTIFY.
+   * PROPERTY_NOTIFY creates the required CCCD with NimBLE.
    */
   service->start();
 
-
   BLEAdvertising *advertising =
       BLEDevice::getAdvertising();
-
 
   if (advertising == nullptr) {
 
@@ -1134,23 +981,18 @@ void startBleUart() {
     return;
   }
 
-
   advertising->addServiceUUID(
       BLE_UART_SERVICE_UUID);
-
 
   advertising->setScanResponse(
       true);
 
-
   BLEDevice::startAdvertising();
-
 
   Serial.println(
       "BLE UART ready; "
       "connect with a Nordic UART compatible app");
 }
-
 
 // ============================================================================
 // BLE command processing
@@ -1164,9 +1006,7 @@ void processBleCommands() {
     return;
   }
 
-
   BleCommand command;
-
 
   while (
       xQueueReceive(
@@ -1174,9 +1014,6 @@ void processBleCommands() {
           &command,
           0) == pdTRUE) {
 
-    /*
-     * Ctrl+C.
-     */
     if (
         static_cast<uint8_t>(
             command.text[0]) == 0x03) {
@@ -1190,7 +1027,6 @@ void processBleCommands() {
     }
   }
 }
-
 
 // ============================================================================
 // Console help
@@ -1226,7 +1062,6 @@ void printSerialHelp() {
       "  update - check for a firmware update");
 }
 
-
 // ============================================================================
 // Wi-Fi information
 // ============================================================================
@@ -1248,12 +1083,10 @@ void printIpAddress() {
   }
 }
 
-
 void printHostname() {
 
   const char *hostname =
       WiFi.getHostname();
-
 
   consolePrintf(
       "Hostname: %s\n",
@@ -1261,7 +1094,6 @@ void printHostname() {
           ? hostname
           : "not set");
 }
-
 
 void printWlanInfo() {
 
@@ -1272,7 +1104,6 @@ void printWlanInfo() {
           ? "connected"
           : "disconnected");
 
-
   if (
       WiFi.status() !=
       WL_CONNECTED) {
@@ -1280,42 +1111,34 @@ void printWlanInfo() {
     return;
   }
 
-
   consolePrintf(
       "SSID: %s\n",
       WiFi.SSID().c_str());
-
 
   consolePrintf(
       "Signal strength: %d dBm\n",
       WiFi.RSSI());
 
-
   consolePrintf(
       "MAC address: %s\n",
       WiFi.macAddress().c_str());
-
 
   consolePrintf(
       "IP address: %s\n",
       WiFi.localIP().toString().c_str());
 
-
   consolePrintf(
       "Gateway: %s\n",
       WiFi.gatewayIP().toString().c_str());
-
 
   consolePrintf(
       "Subnet mask: %s\n",
       WiFi.subnetMask().toString().c_str());
 
-
   consolePrintf(
       "DNS server: %s\n",
       WiFi.dnsIP().toString().c_str());
 }
-
 
 // ============================================================================
 // Time
@@ -1325,7 +1148,6 @@ void printCurrentTime() {
 
   const time_t currentTime =
       time(nullptr);
-
 
   if (
       currentTime <
@@ -1337,13 +1159,11 @@ void printCurrentTime() {
     return;
   }
 
-
   struct tm utcTime;
 
   gmtime_r(
       &currentTime,
       &utcTime);
-
 
   struct tm localTime;
 
@@ -1351,11 +1171,8 @@ void printCurrentTime() {
       &currentTime,
       &localTime);
 
-
   char formattedUtcTime[24];
-
   char formattedLocalTime[24];
-
 
   strftime(
       formattedUtcTime,
@@ -1363,18 +1180,15 @@ void printCurrentTime() {
       "%Y-%m-%dT%H:%M:%S",
       &utcTime);
 
-
   strftime(
       formattedLocalTime,
       sizeof(formattedLocalTime),
       "%Y-%m-%dT%H:%M:%S",
       &localTime);
 
-
   consolePrintf(
       "Time (UTC): %sZ\n",
       formattedUtcTime);
-
 
   consolePrintf(
       "Time (Germany): %s %s\n",
@@ -1383,7 +1197,6 @@ void printCurrentTime() {
           ? "CEST"
           : "CET");
 }
-
 
 // ============================================================================
 // Firmware version
@@ -1406,7 +1219,6 @@ void printFirmwareVersion() {
   }
 }
 
-
 // ============================================================================
 // Wi-Fi provisioning
 // ============================================================================
@@ -1416,19 +1228,12 @@ void cancelWifiProvisioning() {
   provisioningState =
       ProvisioningState::Idle;
 
-
-  pendingSsid =
-      "";
-
-
-  serialLine =
-      "";
-
+  pendingSsid = "";
+  serialLine = "";
 
   consolePrintln(
       "Wi-Fi setup cancelled; "
       "existing credentials were preserved");
-
 
   if (
       !wifiSsid.isEmpty()) {
@@ -1437,13 +1242,11 @@ void cancelWifiProvisioning() {
   }
 }
 
-
 bool saveWifiCredentials(
     const String &ssid,
     const String &password) {
 
   Preferences preferences;
-
 
   if (
       !preferences.begin(
@@ -1453,7 +1256,6 @@ bool saveWifiCredentials(
     return false;
   }
 
-
   const bool saved =
       preferences.putString(
           "ssid",
@@ -1462,13 +1264,10 @@ bool saveWifiCredentials(
           "password",
           password) > 0;
 
-
   preferences.end();
-
 
   return saved;
 }
-
 
 void handleSerialLine(
     const String &line) {
@@ -1519,10 +1318,8 @@ void handleSerialLine(
       checkForFirmwareUpdate();
     }
 
-
     return;
   }
-
 
   if (
       provisioningState ==
@@ -1539,23 +1336,18 @@ void handleSerialLine(
       return;
     }
 
-
     pendingSsid =
         line;
 
-
     provisioningState =
         ProvisioningState::WaitingForPassword;
-
 
     consolePrintln(
         "Enter Wi-Fi password "
         "(empty for an open network)");
 
-
     return;
   }
-
 
   if (
       line.length() > 63) {
@@ -1567,7 +1359,6 @@ void handleSerialLine(
     return;
   }
 
-
   if (
       !saveWifiCredentials(
           pendingSsid,
@@ -1577,38 +1368,28 @@ void handleSerialLine(
         "Could not save Wi-Fi credentials "
         "to NVS; retry with 'wifi'");
 
-
     provisioningState =
         ProvisioningState::Idle;
-
 
     return;
   }
 
-
   wifiSsid =
       pendingSsid;
-
 
   wifiPassword =
       line;
 
-
-  pendingSsid =
-      "";
-
+  pendingSsid = "";
 
   provisioningState =
       ProvisioningState::Idle;
 
-
   otaCheckComplete =
       false;
 
-
   connectToWifi();
 }
-
 
 // ============================================================================
 // Serial input
@@ -1623,7 +1404,6 @@ void handleSerialInput() {
         static_cast<char>(
             Serial.read());
 
-
     if (
         character == 0x03) {
 
@@ -1632,13 +1412,11 @@ void handleSerialInput() {
       continue;
     }
 
-
     if (
         character == '\r') {
 
       continue;
     }
-
 
     if (
         character == '\n') {
@@ -1646,9 +1424,7 @@ void handleSerialInput() {
       handleSerialLine(
           serialLine);
 
-
-      serialLine =
-          "";
+      serialLine = "";
 
     } else if (
         serialLine.length() < 64) {
@@ -1658,9 +1434,7 @@ void handleSerialInput() {
 
     } else {
 
-      serialLine =
-          "";
-
+      serialLine = "";
 
       consolePrintln(
           "Input too long; "
@@ -1668,7 +1442,6 @@ void handleSerialInput() {
     }
   }
 }
-
 
 // ============================================================================
 // NTP
@@ -1682,10 +1455,8 @@ bool synchronizeClock() {
       "pool.ntp.org",
       "time.nist.gov");
 
-
   const uint32_t startedAt =
       millis();
-
 
   while (
       time(nullptr) <
@@ -1696,12 +1467,10 @@ bool synchronizeClock() {
     delay(250);
   }
 
-
   return
       time(nullptr) >=
       VALID_TIME_THRESHOLD;
 }
-
 
 // ============================================================================
 // OTA helpers
@@ -1712,7 +1481,6 @@ bool saveInstalledReleaseTag(
 
   Preferences preferences;
 
-
   if (
       !preferences.begin(
           OTA_NAMESPACE,
@@ -1721,19 +1489,15 @@ bool saveInstalledReleaseTag(
     return false;
   }
 
-
   const bool saved =
       preferences.putString(
           "tag",
           tag) > 0;
 
-
   preferences.end();
-
 
   return saved;
 }
-
 
 // ============================================================================
 // OTA update
@@ -1751,19 +1515,14 @@ void checkForFirmwareUpdate() {
     return;
   }
 
-
   WiFiClientSecure apiClient;
 
-
   apiClient.useBuiltinCACertBundle();
-
 
   apiClient.setTimeout(
       15000);
 
-
   HTTPClient apiRequest;
-
 
   if (
       !apiRequest.begin(
@@ -1777,29 +1536,23 @@ void checkForFirmwareUpdate() {
     return;
   }
 
-
   apiRequest.setTimeout(
       15000);
-
 
   apiRequest.addHeader(
       "Accept",
       "application/vnd.github+json");
 
-
   apiRequest.addHeader(
       "User-Agent",
       "ESP32-C6");
-
 
   apiRequest.addHeader(
       "X-GitHub-Api-Version",
       "2022-11-28");
 
-
   const int statusCode =
       apiRequest.GET();
-
 
   if (
       statusCode !=
@@ -1810,20 +1563,15 @@ void checkForFirmwareUpdate() {
         "with HTTP %d\n",
         statusCode);
 
-
     apiRequest.end();
-
 
     return;
   }
 
-
   const String releasePayload =
       apiRequest.getString();
 
-
   apiRequest.end();
-
 
   if (
       releasePayload.isEmpty()) {
@@ -1835,15 +1583,12 @@ void checkForFirmwareUpdate() {
     return;
   }
 
-
   JsonDocument release;
-
 
   const DeserializationError jsonError =
       deserializeJson(
           release,
           releasePayload);
-
 
   if (
       jsonError) {
@@ -1855,13 +1600,10 @@ void checkForFirmwareUpdate() {
     return;
   }
 
-
   const String latestTag =
       release["tag_name"] | "";
 
-
   String firmwareUrl;
-
 
   for (
       JsonObject asset :
@@ -1875,11 +1617,9 @@ void checkForFirmwareUpdate() {
           asset["browser_download_url"] |
           "";
 
-
       break;
     }
   }
-
 
   if (
       latestTag.isEmpty() ||
@@ -1891,7 +1631,6 @@ void checkForFirmwareUpdate() {
 
     return;
   }
-
 
   if (
       latestTag ==
@@ -1905,7 +1644,6 @@ void checkForFirmwareUpdate() {
     return;
   }
 
-
   if (
       !firmwareUrl.startsWith(
           "https://")) {
@@ -1917,36 +1655,27 @@ void checkForFirmwareUpdate() {
     return;
   }
 
-
   consolePrintf(
       "Installing GitHub release %s\n",
       latestTag.c_str());
 
-
   WiFiClientSecure firmwareClient;
 
-
   firmwareClient.useBuiltinCACertBundle();
-
 
   firmwareClient.setTimeout(
       15000);
 
-
   HTTPUpdate updater;
-
 
   updater.setFollowRedirects(
       HTTPC_STRICT_FOLLOW_REDIRECTS);
 
-
   updater.rebootOnUpdate(
       false);
 
-
   int lastReportedPercent =
       -1;
-
 
   updater.onProgress(
       [&lastReportedPercent](
@@ -1959,10 +1688,8 @@ void checkForFirmwareUpdate() {
           return;
         }
 
-
         const int percent =
             current * 100 / total;
-
 
         if (
             percent !=
@@ -1971,20 +1698,17 @@ void checkForFirmwareUpdate() {
           lastReportedPercent =
               percent;
 
-
           consolePrintf(
               "OTA progress: %d%%\n",
               percent);
         }
       });
 
-
   const t_httpUpdate_return result =
       updater.update(
           firmwareClient,
           firmwareUrl,
           installedReleaseTag);
-
 
   if (
       result ==
@@ -2015,15 +1739,12 @@ void checkForFirmwareUpdate() {
           "release tag to NVS");
     }
 
-
     consolePrintln(
         "OTA complete; restarting");
-
 
     ESP.restart();
   }
 }
-
 
 // ============================================================================
 // Setup
@@ -2034,39 +1755,84 @@ void setup() {
   Serial.begin(
       115200);
 
+  /*
+   * Give the USB serial connection a short time to become available.
+   */
+  delay(500);
+
+  /*
+   * ESP-IDF debug logging.
+   *
+   * The Arduino IDE must additionally use:
+   *
+   *   Tools -> Core Debug Level -> Debug
+   *
+   * or Verbose for maximum output.
+   */
+  esp_log_level_set(
+      "*",
+      ESP_LOG_DEBUG);
+
+#if defined(CONFIG_NIMBLE_ENABLED)
+
+  esp_log_level_set(
+      "NimBLE",
+      ESP_LOG_DEBUG);
+
+  esp_log_level_set(
+      "NimBLE Host",
+      ESP_LOG_DEBUG);
+
+  esp_log_level_set(
+      "nimble",
+      ESP_LOG_DEBUG);
+
+  esp_log_level_set(
+      "nimble_host",
+      ESP_LOG_DEBUG);
+
+#endif
+
+  Serial.println();
+  Serial.println(
+      "===== ESP-IDF DEBUG LOGGING ENABLED =====");
+
+#if defined(CONFIG_NIMBLE_ENABLED)
+
+  Serial.println(
+      "===== NIMBLE ENABLED =====");
+
+#else
+
+  Serial.println(
+      "===== NIMBLE NOT ENABLED =====");
+
+#endif
 
   setenv(
       "TZ",
       GERMAN_TIME_ZONE,
       1);
 
-
   tzset();
-
 
   pinMode(
       LED_BUILTIN,
       OUTPUT);
 
-
   digitalWrite(
       LED_BUILTIN,
       LOW);
 
-
   deviceHostname =
       createDeviceHostname();
 
-
   loadSettings();
-
 
   startBleUart();
 
-
   lastTemperatureSent =
       millis();
-
 
   if (
       wifiSsid.isEmpty()) {
@@ -2078,10 +1844,8 @@ void setup() {
     connectToWifi();
   }
 
-
   printSerialHelp();
 }
-
 
 // ============================================================================
 // Main loop
@@ -2094,18 +1858,13 @@ void loop() {
    */
   handleSerialInput();
 
-
   /*
-   * BLE commands are also handled in loop().
-   *
-   * The NimBLE callback only puts the command into the queue.
+   * BLE commands are processed outside the NimBLE host task.
    */
   processBleCommands();
 
-
   const uint32_t now =
       millis();
-
 
   // --------------------------------------------------------------------------
   // LED
@@ -2118,10 +1877,8 @@ void loop() {
     lastLedToggle =
         now;
 
-
     ledState =
         !ledState;
-
 
     digitalWrite(
         LED_BUILTIN,
@@ -2129,7 +1886,6 @@ void loop() {
             ? HIGH
             : LOW);
   }
-
 
   // --------------------------------------------------------------------------
   // OTA
@@ -2143,15 +1899,12 @@ void loop() {
     otaCheckComplete =
         true;
 
-
     consolePrintln(
         "Wi-Fi connected; checking "
         "latest GitHub release");
 
-
     checkForFirmwareUpdate();
   }
-
 
   // --------------------------------------------------------------------------
   // Temperature
@@ -2166,10 +1919,8 @@ void loop() {
     lastTemperatureSent =
         now;
 
-
     const float temperatureCelsius =
         temperatureRead();
-
 
     if (
         isfinite(
@@ -2187,7 +1938,6 @@ void loop() {
           "read failed");
     }
   }
-
 
   delay(1);
 }
