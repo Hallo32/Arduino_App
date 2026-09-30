@@ -50,7 +50,7 @@ jobs:
 
   release:
     name: Create GitHub release
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name ==  'workflow_dispatch'
     needs: compile
     runs-on: ubuntu-latest
     permissions:
