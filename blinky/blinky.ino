@@ -10,33 +10,61 @@
 #include <WiFiClientSecure.h>
 #include <math.h>
 #include <stdarg.h>
-#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
 constexpr char GITHUB_RELEASE_API[] =
     "https://api.github.com/repos/Hallo32/Arduino_App/releases/latest";
-constexpr char FIRMWARE_ASSET_NAME[] = "blinky.ino.bin";
-constexpr char DEVICE_HOSTNAME_PREFIX[] = "ESP32-C6-";
+
+constexpr char FIRMWARE_ASSET_NAME[] =
+    "blinky.ino.bin";
+
+constexpr char DEVICE_HOSTNAME_PREFIX[] =
+    "ESP32-C6-";
+
 
 constexpr char BLE_UART_SERVICE_UUID[] =
     "6E400001-B5A3-F393-E0A9-E50E24DCCA9E";
+
 constexpr char BLE_UART_RX_UUID[] =
     "6E400002-B5A3-F393-E0A9-E50E24DCCA9E";
+
 constexpr char BLE_UART_TX_UUID[] =
     "6E400003-B5A3-F393-E0A9-E50E24DCCA9E";
 
-constexpr char WIFI_NAMESPACE[] = "wifi";
-constexpr char OTA_NAMESPACE[] = "ota";
 
-constexpr uint32_t BLINK_INTERVAL_MS = 500;
-constexpr uint32_t TIME_SYNC_TIMEOUT_MS = 20000;
-constexpr uint32_t TEMPERATURE_INTERVAL_MS = 300000;
+constexpr char WIFI_NAMESPACE[] =
+    "wifi";
 
-constexpr time_t VALID_TIME_THRESHOLD = 1700000000;
+constexpr char OTA_NAMESPACE[] =
+    "ota";
+
+
+constexpr uint32_t BLINK_INTERVAL_MS =
+    500;
+
+constexpr uint32_t TIME_SYNC_TIMEOUT_MS =
+    20000;
+
+constexpr uint32_t TEMPERATURE_INTERVAL_MS =
+    300000;
+
+constexpr time_t VALID_TIME_THRESHOLD =
+    1700000000;
+
 
 constexpr char GERMAN_TIME_ZONE[] =
     "CET-1CEST,M3.5.0/2,M10.5.0/3";
+
+
+// ============================================================================
+// State
+// ============================================================================
 
 enum class ProvisioningState : uint8_t {
   Idle,
@@ -44,83 +72,161 @@ enum class ProvisioningState : uint8_t {
   WaitingForPassword
 };
 
+
 bool ledState = false;
+
 bool otaCheckComplete = false;
 
 uint32_t lastLedToggle = 0;
 
+uint32_t lastTemperatureSent = 0;
+
+
 String wifiSsid;
+
 String wifiPassword;
+
 String installedReleaseTag;
+
 String deviceHostname;
+
 String pendingSsid;
+
 String serialLine;
+
 
 ProvisioningState provisioningState =
     ProvisioningState::Idle;
 
+
+// ============================================================================
+// BLE state
+// ============================================================================
+
 BLEServer *bleServer = nullptr;
-BLECharacteristic *bleTxCharacteristic = nullptr;
 
-QueueHandle_t bleCommandQueue = nullptr;
+BLECharacteristic *bleTxCharacteristic =
+    nullptr;
 
-uint32_t lastTemperatureSent = 0;
-
-struct BleCommand {
-  char text[65];
-};
+QueueHandle_t bleCommandQueue =
+    nullptr;
 
 
-// -----------------------------------------------------------------------------
+/*
+ * This flag is deliberately used instead of relying only on
+ * getConnectedCount().
+ *
+ * A connected BLE client does not necessarily have notifications
+ * enabled for the TX characteristic.
+ *
+ * Calling notify() without a subscriber results in
+ * ERROR_NO_SUBSCRIBER (Status == 6).
+ *
+ * More importantly, we do NOT install an onStatus() callback here.
+ * Such a callback must never call consolePrintf(), because
+ * consolePrintf() can itself call notify() and re-enter NimBLE.
+ */
+volatile bool bleTxSubscribed = false;
+
+
+// ============================================================================
 // BLE output
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void sendBleText(
     const char *text,
     size_t length) {
 
-  if (bleTxCharacteristic == nullptr ||
-      bleServer == nullptr ||
-      bleServer->getConnectedCount() == 0) {
+  if (text == nullptr ||
+      length == 0) {
+
     return;
   }
 
+
+  if (bleTxCharacteristic == nullptr ||
+      bleServer == nullptr) {
+
+    return;
+  }
+
+
+  if (bleServer->getConnectedCount() == 0) {
+
+    return;
+  }
+
+
+  if (!bleTxSubscribed) {
+
+    return;
+  }
+
+
   /*
-   * NUS-style BLE notification.
+   * Keep packets at 20 bytes.
    *
-   * We deliberately keep the chunks at 20 bytes here.
-   * This works without requiring a larger negotiated MTU and
-   * therefore keeps compatibility with simple BLE UART clients.
+   * This avoids depending on a negotiated ATT MTU.
    */
   constexpr size_t BLE_CHUNK_SIZE = 20;
 
-  for (size_t offset = 0;
-       offset < length;
-       offset += BLE_CHUNK_SIZE) {
+
+  for (
+      size_t offset = 0;
+      offset < length;
+      offset += BLE_CHUNK_SIZE) {
 
     const size_t chunkLength =
-        min(BLE_CHUNK_SIZE, length - offset);
+        min(
+            BLE_CHUNK_SIZE,
+            length - offset);
+
 
     bleTxCharacteristic->setValue(
         reinterpret_cast<const uint8_t *>(
             text + offset),
         chunkLength);
 
+
+    /*
+     * IMPORTANT:
+     *
+     * No BLE callback is installed on this characteristic.
+     *
+     * Therefore notify() cannot recursively call our own
+     * logging code.
+     */
     bleTxCharacteristic->notify();
 
+
+    /*
+     * Give NimBLE some time between packets.
+     */
     delay(10);
   }
 }
 
 
+// ============================================================================
+// Console output
+// ============================================================================
+
 void consolePrintln(
     const char *text) {
 
+  if (text == nullptr) {
+
+    return;
+  }
+
+
   Serial.println(text);
+
 
   sendBleText(
       text,
       strlen(text));
+
 
   sendBleText(
       "\r\n",
@@ -132,10 +238,21 @@ void consolePrintf(
     const char *format,
     ...) {
 
+  if (format == nullptr) {
+
+    return;
+  }
+
+
   char buffer[256];
 
+
   va_list arguments;
-  va_start(arguments, format);
+
+  va_start(
+      arguments,
+      format);
+
 
   const int length =
       vsnprintf(
@@ -144,20 +261,27 @@ void consolePrintf(
           format,
           arguments);
 
+
   va_end(arguments);
 
+
   if (length <= 0) {
+
     return;
   }
+
 
   const size_t outputLength =
       min(
           static_cast<size_t>(length),
           sizeof(buffer) - 1);
 
+
   Serial.write(
-      reinterpret_cast<const uint8_t *>(buffer),
+      reinterpret_cast<const uint8_t *>(
+          buffer),
       outputLength);
+
 
   sendBleText(
       buffer,
@@ -165,9 +289,9 @@ void consolePrintf(
 }
 
 
-// -----------------------------------------------------------------------------
-// BLE UART RX
-// -----------------------------------------------------------------------------
+// ============================================================================
+// BLE RX callback
+// ============================================================================
 
 class BleUartRxCallbacks
     : public BLECharacteristicCallbacks {
@@ -178,36 +302,70 @@ class BleUartRxCallbacks
       BLECharacteristic *characteristic)
       override {
 
+    if (characteristic == nullptr) {
+
+      return;
+    }
+
+
     const uint8_t *data =
         characteristic->getData();
+
 
     const size_t length =
         characteristic->getLength();
 
-    consolePrintf(
-        "BLE UART RX write: %u bytes\n",
-        static_cast<unsigned>(length));
 
-    for (size_t index = 0;
-         index < length;
-         ++index) {
+    if (data == nullptr ||
+        length == 0) {
+
+      return;
+    }
+
+
+    /*
+     * IMPORTANT:
+     *
+     * Do NOT call consolePrintf() here.
+     *
+     * This function executes in the NimBLE host context.
+     * consolePrintf() can call notify(), which would enter
+     * NimBLE again.
+     *
+     * Instead we only collect the command and put it into
+     * a FreeRTOS queue. The command is processed later
+     * from loop().
+     */
+
+    for (
+        size_t index = 0;
+        index < length;
+        ++index) {
 
       const char value =
-          static_cast<char>(data[index]);
+          static_cast<char>(
+              data[index]);
+
 
       if (value == '\r') {
+
         continue;
       }
+
 
       if (value == '\n' ||
           value == 0x03) {
 
         BleCommand command{};
 
+
         if (value == 0x03) {
 
           command.text[0] =
               value;
+
+          command.text[1] =
+              '\0';
 
         } else {
 
@@ -216,9 +374,11 @@ class BleUartRxCallbacks
               line_,
               lineLength_);
 
+
           command.text[lineLength_] =
               '\0';
         }
+
 
         if (bleCommandQueue != nullptr) {
 
@@ -228,12 +388,17 @@ class BleUartRxCallbacks
               0);
         }
 
-        lineLength_ = 0;
+
+        lineLength_ =
+            0;
+
 
         continue;
       }
 
-      if (lineLength_ <
+
+      if (
+          lineLength_ <
           sizeof(line_) - 1) {
 
         line_[lineLength_++] =
@@ -241,284 +406,274 @@ class BleUartRxCallbacks
 
       } else {
 
-        lineLength_ = 0;
+        /*
+         * Overflow:
+         * discard the current line.
+         */
+        lineLength_ =
+            0;
       }
     }
   }
+
 
  private:
 
   char line_[64]{};
 
-  size_t lineLength_ = 0;
+  size_t lineLength_ =
+      0;
 };
 
 
-// -----------------------------------------------------------------------------
-// BLE UART TX status
-// -----------------------------------------------------------------------------
+// ============================================================================
+// BLE TX subscription callback
+// ============================================================================
 
-class BleUartTxCallbacks
+class BleUartSubscriptionCallbacks
     : public BLECharacteristicCallbacks {
 
  public:
 
-  void onStatus(
+  void onSubscribe(
       BLECharacteristic *,
-      Status status,
-      uint32_t code)
+      ble_gap_conn_desc *,
+      uint16_t subValue)
       override {
 
-    if (status == SUCCESS_NOTIFY) {
-      return;
-    }
-
-    consolePrintf(
-        "BLE UART TX notification status=%u "
-        "code=%lu (0x%08lX)\n",
-        static_cast<unsigned>(status),
-        static_cast<unsigned long>(code),
-        static_cast<unsigned long>(code));
+    /*
+     * NimBLE CCCD:
+     *
+     * bit 0 = notifications
+     * bit 1 = indications
+     *
+     * We only use notifications.
+     */
+    bleTxSubscribed =
+        (subValue & 0x0001U) != 0;
   }
 };
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // BLE server callbacks
-// -----------------------------------------------------------------------------
+// ============================================================================
 
-class BleServerDebugCallbacks
+class BleServerCallbacksImpl
     : public BLEServerCallbacks {
 
  public:
 
-  /*
-   * Common callback.
-   *
-   * With NimBLE Core 3.3.12 the stack calls both:
-   *
-   *   onConnect(BLEServer*)
-   *
-   * and
-   *
-   *   onConnect(BLEServer*, ble_gap_conn_desc*)
-   *
-   * We use the NimBLE-specific callback below for detailed information.
-   *
-   * Therefore the common callback is intentionally quiet when NimBLE
-   * is enabled, preventing duplicate log messages.
-   */
-  void onConnect(
-      BLEServer *server)
-      override {
-
-#if !defined(CONFIG_NIMBLE_ENABLED)
-
-    consolePrintf(
-        "BLE client connected; "
-        "clients=%lu, local MTU=%u\n",
-        static_cast<unsigned long>(
-            server->getConnectedCount()),
-        static_cast<unsigned>(
-            BLEDevice::getMTU()));
-
-#endif
-  }
-
-
-  /*
-   * Common disconnect callback.
-   *
-   * The detailed NimBLE disconnect information is emitted by the
-   * NimBLE-specific overload below.
-   */
-  void onDisconnect(
-      BLEServer *server)
-      override {
-
-#if !defined(CONFIG_NIMBLE_ENABLED)
-
-    consolePrintf(
-        "BLE client disconnected; "
-        "clients=%lu\n",
-        static_cast<unsigned long>(
-            server->getConnectedCount()));
-
-    BLEDevice::startAdvertising();
-
-#endif
-  }
-
-
-#if defined(CONFIG_NIMBLE_ENABLED)
-
-  /*
-   * NimBLE-specific CONNECT callback.
-   *
-   * This callback is available in Arduino-ESP32 Core 3.3.12.
-   */
   void onConnect(
       BLEServer *server,
       ble_gap_conn_desc *desc)
       override {
 
-    if (desc == nullptr) {
+    /*
+     * Only use Serial here.
+     *
+     * Do not use consolePrintf() because that would potentially
+     * invoke BLE notify() from inside the NimBLE host task.
+     */
 
-      consolePrintf(
-          "BLE CONNECT: descriptor unavailable; "
-          "clients=%lu\n",
-          static_cast<unsigned long>(
-              server->getConnectedCount()));
+    Serial.println();
 
-      return;
-    }
+    Serial.println(
+        "========== BLE CONNECT ==========");
 
-    consolePrintf(
-        "\n"
-        "======== BLE CONNECT =========\n"
-        "handle       : %u\n"
-        "interval     : %u (%.2f ms)\n"
-        "latency      : %u\n"
-        "timeout      : %u (%u ms)\n"
-        "encrypted    : %s\n"
-        "authenticated: %s\n"
-        "bonded       : %s\n"
-        "local MTU    : %u\n"
-        "==============================\n",
-        static_cast<unsigned>(
-            desc->conn_handle),
-
-        static_cast<unsigned>(
-            desc->conn_itvl),
-
-        desc->conn_itvl * 1.25,
-
-        static_cast<unsigned>(
-            desc->conn_latency),
-
-        static_cast<unsigned>(
-            desc->supervision_timeout),
-
-        static_cast<unsigned>(
-            desc->supervision_timeout * 10),
-
-        desc->sec_state.encrypted
-            ? "yes"
-            : "no",
-
-        desc->sec_state.authenticated
-            ? "yes"
-            : "no",
-
-        desc->sec_state.bonded
-            ? "yes"
-            : "no",
-
-        static_cast<unsigned>(
-            BLEDevice::getMTU()));
-  }
-
-
-  /*
-   * IMPORTANT:
-   *
-   * This is the callback that contains the actual NimBLE
-   * disconnect descriptor.
-   *
-   * Arduino-ESP32 3.3.12 invokes:
-   *
-   *   onDisconnect(server);
-   *   onDisconnect(server, &event->disconnect.conn);
-   *
-   * for a NimBLE disconnect.
-   */
-  void onDisconnect(
-      BLEServer *server,
-      ble_gap_conn_desc *desc)
-      override {
 
     if (desc != nullptr) {
 
-      consolePrintf(
-          "\n"
-          "======== BLE DISCONNECT =========\n"
-          "handle       : %u\n"
-          "reason       : %u (0x%02X)\n"
-          "interval     : %u (%.2f ms)\n"
-          "latency      : %u\n"
-          "timeout      : %u (%u ms)\n"
-          "encrypted    : %s\n"
-          "authenticated: %s\n"
-          "bonded       : %s\n"
-          "clients      : %lu\n"
-          "=================================\n",
+      Serial.printf(
+          "handle       : %u\n",
           static_cast<unsigned>(
-              desc->conn_handle),
+              desc->conn_handle));
 
-          static_cast<unsigned>(
-              desc->conn_handle == BLE_HS_CONN_HANDLE_NONE
-                  ? 0
-                  : 0),
 
-          0,
-
+      Serial.printf(
+          "interval     : %u (%.2f ms)\n",
           static_cast<unsigned>(
               desc->conn_itvl),
+          desc->conn_itvl * 1.25);
 
-          desc->conn_itvl * 1.25,
 
+      Serial.printf(
+          "latency      : %u\n",
           static_cast<unsigned>(
-              desc->conn_latency),
+              desc->conn_latency));
 
+
+      Serial.printf(
+          "timeout      : %u (%u ms)\n",
           static_cast<unsigned>(
               desc->supervision_timeout),
-
           static_cast<unsigned>(
-              desc->supervision_timeout * 10),
+              desc->supervision_timeout * 10));
 
+
+      Serial.printf(
+          "encrypted    : %s\n",
           desc->sec_state.encrypted
               ? "yes"
-              : "no",
+              : "no");
 
+
+      Serial.printf(
+          "authenticated: %s\n",
           desc->sec_state.authenticated
               ? "yes"
-              : "no",
+              : "no");
 
+
+      Serial.printf(
+          "bonded       : %s\n",
           desc->sec_state.bonded
               ? "yes"
-              : "no",
+              : "no");
 
-          static_cast<unsigned long>(
-              server->getConnectedCount()));
 
-    } else {
+      Serial.printf(
+          "local MTU    : %u\n",
+          static_cast<unsigned>(
+              BLEDevice::getMTU()));
 
-      consolePrintln(
-          "\n"
-          "======== BLE DISCONNECT =========\n"
-          "NimBLE connection descriptor unavailable\n"
-          "=================================\n");
+
+      Serial.printf(
+          "peer MTU     : %u\n",
+          static_cast<unsigned>(
+              server->getPeerMTU(
+                  desc->conn_handle)));
     }
 
-    /*
-     * The descriptor does NOT contain the GAP disconnect reason.
-     *
-     * Arduino-ESP32 Core 3.3.12 passes the descriptor to this callback,
-     * but the actual reason is available in the underlying GAP event.
-     *
-     * Therefore the detailed reason is printed by the NimBLE stack
-     * itself when debug logging is enabled.
-     */
 
+    Serial.println(
+        "=================================");
+  }
+
+
+  void onDisconnect(
+      BLEServer *,
+      ble_gap_conn_desc *desc)
+      override {
+
+    /*
+     * Reset subscription state BEFORE restarting advertising.
+     */
+    bleTxSubscribed =
+        false;
+
+
+    Serial.println();
+
+    Serial.println(
+        "======== BLE DISCONNECT =========");
+
+
+    if (desc != nullptr) {
+
+      Serial.printf(
+          "handle       : %u\n",
+          static_cast<unsigned>(
+              desc->conn_handle));
+
+
+      Serial.printf(
+          "interval     : %u (%.2f ms)\n",
+          static_cast<unsigned>(
+              desc->conn_itvl),
+          desc->conn_itvl * 1.25);
+
+
+      Serial.printf(
+          "latency      : %u\n",
+          static_cast<unsigned>(
+              desc->conn_latency));
+
+
+      Serial.printf(
+          "timeout      : %u (%u ms)\n",
+          static_cast<unsigned>(
+              desc->supervision_timeout),
+          static_cast<unsigned>(
+              desc->supervision_timeout * 10));
+
+
+      Serial.printf(
+          "encrypted    : %s\n",
+          desc->sec_state.encrypted
+              ? "yes"
+              : "no");
+
+
+      Serial.printf(
+          "authenticated: %s\n",
+          desc->sec_state.authenticated
+              ? "yes"
+              : "no");
+
+
+      Serial.printf(
+          "bonded       : %s\n",
+          desc->sec_state.bonded
+              ? "yes"
+              : "no");
+    }
+
+
+    /*
+     * The actual GAP disconnect reason is not contained
+     * in ble_gap_conn_desc.
+     *
+     * NimBLE/Arduino-ESP32 prints that information through
+     * its own debug logging.
+     */
+    Serial.println(
+        "Disconnect reason is provided by "
+        "the NimBLE/Arduino-ESP32 debug log.");
+
+
+    Serial.println(
+        "=================================");
+
+
+    /*
+     * Start advertising again after the client disconnects.
+     */
     BLEDevice::startAdvertising();
   }
 
 
-  /*
-   * Connection parameter update callback.
-   *
-   * This is exactly the API exposed by Core 3.3.12.
-   */
+  void onMtuChanged(
+      BLEServer *server,
+      ble_gap_conn_desc *desc,
+      uint16_t mtu)
+      override {
+
+    /*
+     * Serial only.
+     */
+    Serial.printf(
+        "BLE MTU CHANGED: "
+        "handle=%u, "
+        "mtu=%u, "
+        "peer MTU=%u\n",
+
+        desc != nullptr
+            ? static_cast<unsigned>(
+                  desc->conn_handle)
+            : 0U,
+
+        static_cast<unsigned>(
+            mtu),
+
+        desc != nullptr
+            ? static_cast<unsigned>(
+                  server->getPeerMTU(
+                      desc->conn_handle))
+            : 0U);
+  }
+
+
   void onConnParamsUpdate(
       uint16_t conn_handle,
       uint16_t interval,
@@ -527,7 +682,10 @@ class BleServerDebugCallbacks
       uint8_t status)
       override {
 
-    consolePrintf(
+    /*
+     * Serial only.
+     */
+    Serial.printf(
         "BLE CONN PARAMS: "
         "handle=%u, "
         "interval=%u (%.2f ms), "
@@ -555,34 +713,12 @@ class BleServerDebugCallbacks
         static_cast<unsigned>(
             status));
   }
-
-
-  /*
-   * MTU update callback.
-   */
-  void onMtuChanged(
-      BLEServer *,
-      ble_gap_conn_desc *desc,
-      uint16_t mtu)
-      override {
-
-    consolePrintf(
-        "BLE MTU UPDATE: "
-        "handle=%u, mtu=%u\n",
-        desc != nullptr
-            ? static_cast<unsigned>(
-                  desc->conn_handle)
-            : 0U,
-        static_cast<unsigned>(mtu));
-  }
-
-#endif
 };
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Forward declarations
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void checkForFirmwareUpdate();
 
@@ -592,15 +728,17 @@ void handleSerialLine(
 void cancelWifiProvisioning();
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Settings
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void loadSettings() {
 
   Preferences preferences;
 
-  if (preferences.begin(
+
+  if (
+      preferences.begin(
           WIFI_NAMESPACE,
           true)) {
 
@@ -609,15 +747,19 @@ void loadSettings() {
             "ssid",
             "");
 
+
     wifiPassword =
         preferences.getString(
             "password",
             "");
 
+
     preferences.end();
   }
 
-  if (preferences.begin(
+
+  if (
+      preferences.begin(
           OTA_NAMESPACE,
           true)) {
 
@@ -626,27 +768,34 @@ void loadSettings() {
             "tag",
             "");
 
+
     preferences.end();
   }
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Wi-Fi
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void connectToWifi() {
 
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(
+      WIFI_STA);
+
 
   WiFi.setHostname(
       deviceHostname.c_str());
 
-  WiFi.setAutoReconnect(true);
+
+  WiFi.setAutoReconnect(
+      true);
+
 
   WiFi.begin(
       wifiSsid.c_str(),
       wifiPassword.c_str());
+
 
   consolePrintln(
       "Connecting to saved Wi-Fi network");
@@ -659,30 +808,37 @@ void startWifiProvisioning() {
       false,
       false);
 
-  pendingSsid = "";
+
+  pendingSsid =
+      "";
+
 
   provisioningState =
       ProvisioningState::WaitingForSsid;
 
+
   consolePrintln(
       "Wi-Fi setup: existing credentials "
       "will be overwritten");
+
 
   consolePrintln(
       "Enter SSID in the serial monitor");
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Hostname
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 String createDeviceHostname() {
 
   const uint64_t mac =
       ESP.getEfuseMac();
 
+
   char hostname[32];
+
 
   snprintf(
       hostname,
@@ -692,28 +848,40 @@ String createDeviceHostname() {
       static_cast<unsigned long long>(
           mac & 0xFFFFFFULL));
 
-  return String(hostname);
+
+  return String(
+      hostname);
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // BLE setup
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void startBleUart() {
 
-  if (!BLEDevice::init(
+  /*
+   * BLEDevice::init() is a valid bool-returning API
+   * in Arduino-ESP32 3.3.12.
+   */
+  if (
+      !BLEDevice::init(
           deviceHostname)) {
 
-    consolePrintln(
+    Serial.println(
         "BLE initialization failed");
 
     return;
   }
 
-  consolePrintf(
-      "BLE initialized; stack=%s, local MTU=%u\n",
+
+  Serial.printf(
+      "BLE initialized; "
+      "stack=%s, "
+      "local MTU=%u\n",
+
       BLEDevice::getBLEStackString().c_str(),
+
       static_cast<unsigned>(
           BLEDevice::getMTU()));
 
@@ -723,9 +891,11 @@ void startBleUart() {
           4,
           sizeof(BleCommand));
 
-  if (bleCommandQueue == nullptr) {
 
-    consolePrintln(
+  if (
+      bleCommandQueue == nullptr) {
+
+    Serial.println(
         "BLE UART command queue creation failed");
 
     return;
@@ -735,9 +905,10 @@ void startBleUart() {
   bleServer =
       BLEDevice::createServer();
 
+
   if (bleServer == nullptr) {
 
-    consolePrintln(
+    Serial.println(
         "BLE server creation failed");
 
     return;
@@ -745,16 +916,17 @@ void startBleUart() {
 
 
   bleServer->setCallbacks(
-      new BleServerDebugCallbacks());
+      new BleServerCallbacksImpl());
 
 
   BLEService *service =
       bleServer->createService(
           BLE_UART_SERVICE_UUID);
 
+
   if (service == nullptr) {
 
-    consolePrintln(
+    Serial.println(
         "BLE UART service creation failed");
 
     return;
@@ -767,13 +939,15 @@ void startBleUart() {
           BLECharacteristic::PROPERTY_WRITE |
           BLECharacteristic::PROPERTY_WRITE_NR);
 
+
   if (rxCharacteristic == nullptr) {
 
-    consolePrintln(
+    Serial.println(
         "BLE UART RX characteristic creation failed");
 
     return;
   }
+
 
   rxCharacteristic->setCallbacks(
       new BleUartRxCallbacks());
@@ -784,9 +958,10 @@ void startBleUart() {
           BLE_UART_TX_UUID,
           BLECharacteristic::PROPERTY_NOTIFY);
 
+
   if (bleTxCharacteristic == nullptr) {
 
-    consolePrintln(
+    Serial.println(
         "BLE UART TX characteristic creation failed");
 
     return;
@@ -796,19 +971,24 @@ void startBleUart() {
   bleTxCharacteristic->setValue(
       "");
 
+
+  /*
+   * Only the subscription callback is installed.
+   *
+   * There is deliberately NO onStatus() callback.
+   */
   bleTxCharacteristic->setCallbacks(
-      new BleUartTxCallbacks());
+      new BleUartSubscriptionCallbacks());
 
 
   /*
-   * With NimBLE the CCCD for NOTIFY is generated
-   * automatically from PROPERTY_NOTIFY.
-   *
-   * No BLE2902 descriptor is required here.
+   * With NimBLE, the CCCD required for NOTIFY is handled
+   * automatically for PROPERTY_NOTIFY.
    */
-  if (!service->start()) {
+  if (
+      !service->start()) {
 
-    consolePrintln(
+    Serial.println(
         "BLE UART service start failed");
 
     return;
@@ -818,9 +998,10 @@ void startBleUart() {
   BLEAdvertising *advertising =
       BLEDevice::getAdvertising();
 
+
   if (advertising == nullptr) {
 
-    consolePrintln(
+    Serial.println(
         "BLE advertising object unavailable");
 
     return;
@@ -830,29 +1011,35 @@ void startBleUart() {
   advertising->addServiceUUID(
       BLE_UART_SERVICE_UUID);
 
+
   advertising->setScanResponse(
       true);
 
 
   BLEDevice::startAdvertising();
 
-  consolePrintln(
-      "BLE UART ready; connect with a "
-      "Nordic UART compatible app");
+
+  Serial.println(
+      "BLE UART ready; "
+      "connect with a Nordic UART compatible app");
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // BLE command processing
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void processBleCommands() {
 
-  if (bleCommandQueue == nullptr) {
+  if (
+      bleCommandQueue == nullptr) {
+
     return;
   }
 
+
   BleCommand command;
+
 
   while (
       xQueueReceive(
@@ -875,9 +1062,9 @@ void processBleCommands() {
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Console help
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void printSerialHelp() {
 
@@ -910,13 +1097,14 @@ void printSerialHelp() {
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Wi-Fi information
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void printIpAddress() {
 
-  if (WiFi.status() ==
+  if (
+      WiFi.status() ==
       WL_CONNECTED) {
 
     consolePrintf(
@@ -936,6 +1124,7 @@ void printHostname() {
   const char *hostname =
       WiFi.getHostname();
 
+
   consolePrintf(
       "Hostname: %s\n",
       hostname != nullptr
@@ -948,39 +1137,49 @@ void printWlanInfo() {
 
   consolePrintf(
       "Wi-Fi status: %s\n",
-      WiFi.status() == WL_CONNECTED
+      WiFi.status() ==
+          WL_CONNECTED
           ? "connected"
           : "disconnected");
 
-  if (WiFi.status() !=
+
+  if (
+      WiFi.status() !=
       WL_CONNECTED) {
 
     return;
   }
 
+
   consolePrintf(
       "SSID: %s\n",
       WiFi.SSID().c_str());
+
 
   consolePrintf(
       "Signal strength: %d dBm\n",
       WiFi.RSSI());
 
+
   consolePrintf(
       "MAC address: %s\n",
       WiFi.macAddress().c_str());
+
 
   consolePrintf(
       "IP address: %s\n",
       WiFi.localIP().toString().c_str());
 
+
   consolePrintf(
       "Gateway: %s\n",
       WiFi.gatewayIP().toString().c_str());
 
+
   consolePrintf(
       "Subnet mask: %s\n",
       WiFi.subnetMask().toString().c_str());
+
 
   consolePrintf(
       "DNS server: %s\n",
@@ -988,16 +1187,18 @@ void printWlanInfo() {
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Time
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void printCurrentTime() {
 
   const time_t currentTime =
       time(nullptr);
 
-  if (currentTime <
+
+  if (
+      currentTime <
       VALID_TIME_THRESHOLD) {
 
     consolePrintln(
@@ -1044,6 +1245,7 @@ void printCurrentTime() {
       "Time (UTC): %sZ\n",
       formattedUtcTime);
 
+
   consolePrintf(
       "Time (Germany): %s %s\n",
       formattedLocalTime,
@@ -1053,13 +1255,14 @@ void printCurrentTime() {
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Firmware version
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void printFirmwareVersion() {
 
-  if (installedReleaseTag.isEmpty()) {
+  if (
+      installedReleaseTag.isEmpty()) {
 
     consolePrintln(
         "Firmware version: "
@@ -1074,25 +1277,31 @@ void printFirmwareVersion() {
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Wi-Fi provisioning
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void cancelWifiProvisioning() {
 
   provisioningState =
       ProvisioningState::Idle;
 
-  pendingSsid = "";
 
-  serialLine = "";
+  pendingSsid =
+      "";
+
+
+  serialLine =
+      "";
+
 
   consolePrintln(
       "Wi-Fi setup cancelled; "
       "existing credentials were preserved");
 
 
-  if (!wifiSsid.isEmpty()) {
+  if (
+      !wifiSsid.isEmpty()) {
 
     connectToWifi();
   }
@@ -1105,7 +1314,9 @@ bool saveWifiCredentials(
 
   Preferences preferences;
 
-  if (!preferences.begin(
+
+  if (
+      !preferences.begin(
           WIFI_NAMESPACE,
           false)) {
 
@@ -1124,6 +1335,7 @@ bool saveWifiCredentials(
 
   preferences.end();
 
+
   return saved;
 }
 
@@ -1131,10 +1343,12 @@ bool saveWifiCredentials(
 void handleSerialLine(
     const String &line) {
 
-  if (provisioningState ==
+  if (
+      provisioningState ==
       ProvisioningState::Idle) {
 
-    if (line == "wifi") {
+    if (
+        line == "wifi") {
 
       startWifiProvisioning();
 
@@ -1175,14 +1389,17 @@ void handleSerialLine(
       checkForFirmwareUpdate();
     }
 
+
     return;
   }
 
 
-  if (provisioningState ==
+  if (
+      provisioningState ==
       ProvisioningState::WaitingForSsid) {
 
-    if (line.isEmpty() ||
+    if (
+        line.isEmpty() ||
         line.length() > 32) {
 
       consolePrintln(
@@ -1196,18 +1413,22 @@ void handleSerialLine(
     pendingSsid =
         line;
 
+
     provisioningState =
         ProvisioningState::WaitingForPassword;
+
 
     consolePrintln(
         "Enter Wi-Fi password "
         "(empty for an open network)");
 
+
     return;
   }
 
 
-  if (line.length() > 63) {
+  if (
+      line.length() > 63) {
 
     consolePrintln(
         "Password is too long; "
@@ -1217,7 +1438,8 @@ void handleSerialLine(
   }
 
 
-  if (!saveWifiCredentials(
+  if (
+      !saveWifiCredentials(
           pendingSsid,
           line)) {
 
@@ -1225,8 +1447,10 @@ void handleSerialLine(
         "Could not save Wi-Fi credentials "
         "to NVS; retry with 'wifi'");
 
+
     provisioningState =
         ProvisioningState::Idle;
+
 
     return;
   }
@@ -1235,24 +1459,30 @@ void handleSerialLine(
   wifiSsid =
       pendingSsid;
 
+
   wifiPassword =
       line;
 
-  pendingSsid = "";
+
+  pendingSsid =
+      "";
+
 
   provisioningState =
       ProvisioningState::Idle;
 
+
   otaCheckComplete =
       false;
+
 
   connectToWifi();
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Serial input
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void handleSerialInput() {
 
@@ -1264,7 +1494,8 @@ void handleSerialInput() {
             Serial.read());
 
 
-    if (character == 0x03) {
+    if (
+        character == 0x03) {
 
       cancelWifiProvisioning();
 
@@ -1272,17 +1503,22 @@ void handleSerialInput() {
     }
 
 
-    if (character == '\r') {
+    if (
+        character == '\r') {
+
       continue;
     }
 
 
-    if (character == '\n') {
+    if (
+        character == '\n') {
 
       handleSerialLine(
           serialLine);
 
-      serialLine = "";
+
+      serialLine =
+          "";
 
     } else if (
         serialLine.length() < 64) {
@@ -1292,7 +1528,9 @@ void handleSerialInput() {
 
     } else {
 
-      serialLine = "";
+      serialLine =
+          "";
+
 
       consolePrintln(
           "Input too long; "
@@ -1302,9 +1540,9 @@ void handleSerialInput() {
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // NTP
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 bool synchronizeClock() {
 
@@ -1329,21 +1567,24 @@ bool synchronizeClock() {
   }
 
 
-  return time(nullptr) >=
-         VALID_TIME_THRESHOLD;
+  return
+      time(nullptr) >=
+      VALID_TIME_THRESHOLD;
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // OTA helpers
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 bool saveInstalledReleaseTag(
     const String &tag) {
 
   Preferences preferences;
 
-  if (!preferences.begin(
+
+  if (
+      !preferences.begin(
           OTA_NAMESPACE,
           false)) {
 
@@ -1359,13 +1600,19 @@ bool saveInstalledReleaseTag(
 
   preferences.end();
 
+
   return saved;
 }
 
 
+// ============================================================================
+// OTA update
+// ============================================================================
+
 void checkForFirmwareUpdate() {
 
-  if (!synchronizeClock()) {
+  if (
+      !synchronizeClock()) {
 
     consolePrintln(
         "OTA skipped: system time "
@@ -1377,7 +1624,9 @@ void checkForFirmwareUpdate() {
 
   WiFiClientSecure apiClient;
 
+
   apiClient.useBuiltinCACertBundle();
+
 
   apiClient.setTimeout(
       15000);
@@ -1386,7 +1635,8 @@ void checkForFirmwareUpdate() {
   HTTPClient apiRequest;
 
 
-  if (!apiRequest.begin(
+  if (
+      !apiRequest.begin(
           apiClient,
           GITHUB_RELEASE_API)) {
 
@@ -1406,9 +1656,11 @@ void checkForFirmwareUpdate() {
       "Accept",
       "application/vnd.github+json");
 
+
   apiRequest.addHeader(
       "User-Agent",
       "ESP32-C6");
+
 
   apiRequest.addHeader(
       "X-GitHub-Api-Version",
@@ -1419,7 +1671,8 @@ void checkForFirmwareUpdate() {
       apiRequest.GET();
 
 
-  if (statusCode !=
+  if (
+      statusCode !=
       HTTP_CODE_OK) {
 
     consolePrintf(
@@ -1427,7 +1680,9 @@ void checkForFirmwareUpdate() {
         "with HTTP %d\n",
         statusCode);
 
+
     apiRequest.end();
+
 
     return;
   }
@@ -1440,7 +1695,8 @@ void checkForFirmwareUpdate() {
   apiRequest.end();
 
 
-  if (releasePayload.isEmpty()) {
+  if (
+      releasePayload.isEmpty()) {
 
     consolePrintln(
         "Could not parse GitHub release JSON: "
@@ -1459,7 +1715,8 @@ void checkForFirmwareUpdate() {
           releasePayload);
 
 
-  if (jsonError) {
+  if (
+      jsonError) {
 
     consolePrintf(
         "Could not parse GitHub release JSON: %s\n",
@@ -1487,6 +1744,7 @@ void checkForFirmwareUpdate() {
       firmwareUrl =
           asset["browser_download_url"] |
           "";
+
 
       break;
     }
@@ -1518,7 +1776,8 @@ void checkForFirmwareUpdate() {
   }
 
 
-  if (!firmwareUrl.startsWith(
+  if (
+      !firmwareUrl.startsWith(
           "https://")) {
 
     consolePrintln(
@@ -1536,7 +1795,9 @@ void checkForFirmwareUpdate() {
 
   WiFiClientSecure firmwareClient;
 
+
   firmwareClient.useBuiltinCACertBundle();
+
 
   firmwareClient.setTimeout(
       15000);
@@ -1544,14 +1805,17 @@ void checkForFirmwareUpdate() {
 
   HTTPUpdate updater;
 
+
   updater.setFollowRedirects(
       HTTPC_STRICT_FOLLOW_REDIRECTS);
+
 
   updater.rebootOnUpdate(
       false);
 
 
-  int lastReportedPercent = -1;
+  int lastReportedPercent =
+      -1;
 
 
   updater.onProgress(
@@ -1559,7 +1823,9 @@ void checkForFirmwareUpdate() {
           int current,
           int total) {
 
-        if (total <= 0) {
+        if (
+            total <= 0) {
+
           return;
         }
 
@@ -1575,6 +1841,11 @@ void checkForFirmwareUpdate() {
           lastReportedPercent =
               percent;
 
+
+          /*
+           * This callback is NOT a BLE callback.
+           * consolePrintf() is therefore safe here.
+           */
           consolePrintf(
               "OTA progress: %d%%\n",
               percent);
@@ -1609,7 +1880,8 @@ void checkForFirmwareUpdate() {
       result ==
       HTTP_UPDATE_OK) {
 
-    if (!saveInstalledReleaseTag(
+    if (
+        !saveInstalledReleaseTag(
             latestTag)) {
 
       consolePrintln(
@@ -1621,14 +1893,15 @@ void checkForFirmwareUpdate() {
     consolePrintln(
         "OTA complete; restarting");
 
+
     ESP.restart();
   }
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Setup
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void setup() {
 
@@ -1636,10 +1909,14 @@ void setup() {
       115200);
 
 
+  /*
+   * German time zone including daylight saving time.
+   */
   setenv(
       "TZ",
       GERMAN_TIME_ZONE,
       1);
+
 
   tzset();
 
@@ -1647,6 +1924,7 @@ void setup() {
   pinMode(
       LED_BUILTIN,
       OUTPUT);
+
 
   digitalWrite(
       LED_BUILTIN,
@@ -1667,7 +1945,8 @@ void setup() {
       millis();
 
 
-  if (wifiSsid.isEmpty()) {
+  if (
+      wifiSsid.isEmpty()) {
 
     startWifiProvisioning();
 
@@ -1681,14 +1960,22 @@ void setup() {
 }
 
 
-// -----------------------------------------------------------------------------
+// ============================================================================
 // Main loop
-// -----------------------------------------------------------------------------
+// ============================================================================
 
 void loop() {
 
+  /*
+   * Serial processing happens from loop().
+   */
   handleSerialInput();
 
+
+  /*
+   * BLE commands are also processed from loop(),
+   * never directly from the NimBLE callback.
+   */
   processBleCommands();
 
 
@@ -1696,12 +1983,17 @@ void loop() {
       millis();
 
 
+  // --------------------------------------------------------------------------
+  // LED
+  // --------------------------------------------------------------------------
+
   if (
       now - lastLedToggle >=
       BLINK_INTERVAL_MS) {
 
     lastLedToggle =
         now;
+
 
     ledState =
         !ledState;
@@ -1714,6 +2006,10 @@ void loop() {
             : LOW);
   }
 
+
+  // --------------------------------------------------------------------------
+  // OTA
+  // --------------------------------------------------------------------------
 
   if (
       !otaCheckComplete &&
@@ -1733,6 +2029,10 @@ void loop() {
   }
 
 
+  // --------------------------------------------------------------------------
+  // Temperature
+  // --------------------------------------------------------------------------
+
   if (
       bleServer != nullptr &&
       bleServer->getConnectedCount() > 0 &&
@@ -1747,7 +2047,8 @@ void loop() {
         temperatureRead();
 
 
-    if (isfinite(
+    if (
+        isfinite(
             temperatureCelsius)) {
 
       consolePrintf(
@@ -1762,4 +2063,10 @@ void loop() {
           "read failed");
     }
   }
+
+
+  /*
+   * Small yield for FreeRTOS.
+   */
+  delay(1);
 }
