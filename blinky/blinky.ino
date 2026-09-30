@@ -205,9 +205,10 @@ class BleUartTxCallbacks : public BLECharacteristicCallbacks {
     }
 
     // Bewusst nur Serial verwenden.
-    // Kein consolePrintf() innerhalb eines BLE-Callbacks,
-    // damit bei einem Notify-Fehler nicht erneut notify()
-    // ausgelöst wird.
+    //
+    // consolePrintf() würde seinerseits sendBleText() und damit
+    // notify() aufrufen. Das soll innerhalb des Notify-Callbacks
+    // vermieden werden.
 
     Serial.printf(
         "BLE UART TX notification status=%u "
@@ -230,8 +231,15 @@ class BleServerDebugCallbacks : public BLEServerCallbacks {
       BLEServer *server,
       ble_gap_conn_desc *desc) override {
 
-    // Nur Serial verwenden.
-    // Im Connect-Callback kann getConnectedCount() noch 0 sein.
+    // WICHTIG:
+    //
+    // Arduino-ESP32 3.3.12 ruft den Callback vor dem Erhöhen
+    // von m_connectedCount auf. Deshalb kann clients hier noch
+    // 0 sein, obwohl die Verbindung erfolgreich aufgebaut wurde.
+    //
+    // Außerdem ist desc->reason NICHT vorhanden.
+    // Der Disconnect-Grund steht nur im internen NimBLE-GAP-Event.
+
     Serial.println();
     Serial.println("========== BLE CONNECT ==========");
 
@@ -246,7 +254,8 @@ class BleServerDebugCallbacks : public BLEServerCallbacks {
 
     Serial.printf(
         "local MTU    : %u\n",
-        static_cast<unsigned>(BLEDevice::getMTU()));
+        static_cast<unsigned>(
+            BLEDevice::getMTU()));
 
     Serial.printf(
         "peer MTU     : %u\n",
@@ -264,21 +273,26 @@ class BleServerDebugCallbacks : public BLEServerCallbacks {
 
     Serial.printf(
         "timeout      : %u (%.0f ms)\n",
-        static_cast<unsigned>(
-            desc->supervision_timeout),
+        static_cast<unsigned>(desc->supervision_timeout),
         desc->supervision_timeout * 10.0);
 
     Serial.printf(
         "encrypted    : %s\n",
-        desc->sec_state.encrypted ? "yes" : "no");
+        desc->sec_state.encrypted
+            ? "yes"
+            : "no");
 
     Serial.printf(
         "authenticated: %s\n",
-        desc->sec_state.authenticated ? "yes" : "no");
+        desc->sec_state.authenticated
+            ? "yes"
+            : "no");
 
     Serial.printf(
         "bonded       : %s\n",
-        desc->sec_state.bonded ? "yes" : "no");
+        desc->sec_state.bonded
+            ? "yes"
+            : "no");
 
     Serial.println("=================================");
   }
@@ -288,9 +302,6 @@ class BleServerDebugCallbacks : public BLEServerCallbacks {
       BLEServer *server,
       ble_gap_conn_desc *desc) override {
 
-    // Besonders wichtig:
-    // desc->reason ist der Grund für den Disconnect.
-
     Serial.println();
     Serial.println("======== BLE DISCONNECT =========");
 
@@ -299,26 +310,31 @@ class BleServerDebugCallbacks : public BLEServerCallbacks {
         static_cast<unsigned>(desc->conn_handle));
 
     Serial.printf(
-        "reason       : %u (%s)\n",
-        static_cast<unsigned>(desc->reason),
-        BLEUtils::returnCodeToString(desc->reason));
-
-    Serial.printf(
         "clients      : %lu\n",
         static_cast<unsigned long>(
             server->getConnectedCount()));
 
     Serial.printf(
         "encrypted    : %s\n",
-        desc->sec_state.encrypted ? "yes" : "no");
+        desc->sec_state.encrypted
+            ? "yes"
+            : "no");
 
     Serial.printf(
         "authenticated: %s\n",
-        desc->sec_state.authenticated ? "yes" : "no");
+        desc->sec_state.authenticated
+            ? "yes"
+            : "no");
 
     Serial.printf(
         "bonded       : %s\n",
-        desc->sec_state.bonded ? "yes" : "no");
+        desc->sec_state.bonded
+            ? "yes"
+            : "no");
+
+    Serial.println(
+        "Disconnect reason is provided by "
+        "the NimBLE/Arduino-ESP32 debug log.");
 
     Serial.println("=================================");
 
@@ -423,6 +439,7 @@ void startWifiProvisioning() {
   WiFi.disconnect(false, false);
 
   pendingSsid = "";
+
   provisioningState =
       ProvisioningState::WaitingForSsid;
 
@@ -461,14 +478,10 @@ String createDeviceHostname() {
 // -----------------------------------------------------------------------------
 
 void startBleUart() {
-  Serial.println();
-  Serial.println("========== BLE INIT ==============");
-
   if (!BLEDevice::init(deviceHostname)) {
-    Serial.println(
+    consolePrintln(
         "BLE initialization failed");
-    Serial.println(
-        "=================================");
+
     return;
   }
 
@@ -483,23 +496,14 @@ void startBleUart() {
           sizeof(BleCommand));
 
   if (bleCommandQueue == nullptr) {
-    Serial.println(
+    consolePrintln(
         "BLE UART command queue creation failed");
-    Serial.println(
-        "=================================");
+
     return;
   }
 
   bleServer =
       BLEDevice::createServer();
-
-  if (bleServer == nullptr) {
-    Serial.println(
-        "BLE server creation failed");
-    Serial.println(
-        "=================================");
-    return;
-  }
 
   bleServer->setCallbacks(
       new BleServerDebugCallbacks());
@@ -508,27 +512,11 @@ void startBleUart() {
       bleServer->createService(
           BLE_UART_SERVICE_UUID);
 
-  if (service == nullptr) {
-    Serial.println(
-        "BLE service creation failed");
-    Serial.println(
-        "=================================");
-    return;
-  }
-
   BLECharacteristic *rxCharacteristic =
       service->createCharacteristic(
           BLE_UART_RX_UUID,
           BLECharacteristic::PROPERTY_WRITE |
           BLECharacteristic::PROPERTY_WRITE_NR);
-
-  if (rxCharacteristic == nullptr) {
-    Serial.println(
-        "BLE RX characteristic creation failed");
-    Serial.println(
-        "=================================");
-    return;
-  }
 
   rxCharacteristic->setCallbacks(
       new BleUartRxCallbacks());
@@ -537,14 +525,6 @@ void startBleUart() {
       service->createCharacteristic(
           BLE_UART_TX_UUID,
           BLECharacteristic::PROPERTY_NOTIFY);
-
-  if (bleTxCharacteristic == nullptr) {
-    Serial.println(
-        "BLE TX characteristic creation failed");
-    Serial.println(
-        "=================================");
-    return;
-  }
 
   bleTxCharacteristic->setValue("");
 
@@ -563,26 +543,8 @@ void startBleUart() {
 
   BLEDevice::startAdvertising();
 
-  Serial.printf(
-      "BLE service UUID: %s\n",
-      BLE_UART_SERVICE_UUID);
-
-  Serial.printf(
-      "BLE RX UUID     : %s\n",
-      BLE_UART_RX_UUID);
-
-  Serial.printf(
-      "BLE TX UUID     : %s\n",
-      BLE_UART_TX_UUID);
-
-  Serial.println(
-      "BLE advertising started");
-
-  Serial.println(
+  consolePrintln(
       "BLE UART ready; connect with a Nordic UART compatible app");
-
-  Serial.println(
-      "=================================");
 }
 
 
@@ -643,6 +605,7 @@ void printIpAddress() {
     consolePrintf(
         "IP address: %s\n",
         WiFi.localIP().toString().c_str());
+
   } else {
     consolePrintln(
         "IP address: Wi-Fi is not connected");
@@ -712,6 +675,7 @@ void printCurrentTime() {
   if (currentTime < VALID_TIME_THRESHOLD) {
     consolePrintln(
         "Time: not synchronized");
+
     return;
   }
 
@@ -759,9 +723,12 @@ void printCurrentTime() {
 
 void printFirmwareVersion() {
   if (installedReleaseTag.isEmpty()) {
+
     consolePrintln(
         "Firmware version: unknown (no release tag in NVS)");
+
   } else {
+
     consolePrintf(
         "Firmware version: %s\n",
         installedReleaseTag.c_str());
@@ -886,6 +853,7 @@ void handleSerialLine(
   }
 
   if (line.length() > 63) {
+
     consolePrintln(
         "Password is too long; enter it again");
 
@@ -931,7 +899,9 @@ void handleSerialInput() {
             Serial.read());
 
     if (character == 0x03) {
+
       cancelWifiProvisioning();
+
       continue;
     }
 
@@ -1016,8 +986,10 @@ bool saveInstalledReleaseTag(
 
 void checkForFirmwareUpdate() {
   if (!synchronizeClock()) {
+
     consolePrintln(
         "OTA skipped: system time could not be synchronized");
+
     return;
   }
 
